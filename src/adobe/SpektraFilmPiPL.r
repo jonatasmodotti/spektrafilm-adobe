@@ -20,7 +20,7 @@ resource 'PiPL' (16000) {
     AE_Effect_Info_Flags { 0 },
     AE_Effect_Global_OutFlags { 0x02008004 },
 #ifdef AE_OS_WIN
-    AE_Effect_Global_OutFlags_2 { 0x00001401 },
+    AE_Effect_Global_OutFlags_2 { 0x08001401 },
 #else
     AE_Effect_Global_OutFlags_2 { 0x0a001401 },
 #endif

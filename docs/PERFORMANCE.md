@@ -74,7 +74,9 @@ the host, to restore the exact computation for comparison.
 
 Also: the GPU bridge reuses the renderer's scratch buffers between frames, the
 CPU path keeps its staging memory per worker thread, and After Effects may
-render frames concurrently (multi-frame rendering) on macOS.
+render frames concurrently (multi-frame rendering) on macOS and Windows. On
+Windows the concurrent renderers share one Vulkan device and its transient
+memory budget.
 
 ## Tried and rejected
 

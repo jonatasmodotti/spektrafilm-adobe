@@ -337,10 +337,7 @@ extern "C" DllExport PF_Err EffectMain(PF_Cmd command, PF_InData* in_data, PF_Ou
         // Keep in sync with SpektraFilmPiPL.r.
         out_data->out_flags = PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_NON_PARAM_VARY | PF_OutFlag_CUSTOM_UI;
         out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER |
-          PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS;
-#ifdef __APPLE__
-        out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
-#endif
+          PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS | PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
         if (in_data->appl_id == kAppID_Premiere) {
           Suite<PF_PixelFormatSuite1> formats(in_data->pica_basicP, kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
           PF_Err err = formats->ClearSupportedPixelFormats(in_data->effect_ref);

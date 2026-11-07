@@ -11,8 +11,8 @@ spectral film simulation, to Adobe hosts. It renders with the C++/GPU engine of
 Vulkan on Windows.
 
 **Version 0.1.0.** Tested in After Effects and Premiere Pro on macOS (Apple
-Silicon). The Windows build is written and checked for compile errors but has
-not run on Windows yet. There are no binary releases: build from source.
+Silicon) and on Windows 11 (NVIDIA, Vulkan). There are no binary releases:
+build from source.
 
 ## What it does
 

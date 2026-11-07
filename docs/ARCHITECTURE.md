@@ -78,7 +78,9 @@ applies the effect to a new composition in After Effects.
 
 - Region-of-interest and tiled rendering: the effect always renders the full
   frame.
-- Windows: the build and the render have not been tested on Windows yet.
+- Automated GPU tests on Windows: there `ctest` runs only `frame_layout`. The
+  Vulkan renderer was checked by hand with upstream's
+  `SpektraVulkanCopyHarness`, and the effect in After Effects and Premiere Pro.
 - GPU frames on Windows, and Metal devices other than the system default.
 - The remaining spektrafilm-ofx controls (DIR couplers, scanner, auto
   exposure) and reading the host's color management.

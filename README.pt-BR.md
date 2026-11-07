@@ -12,8 +12,7 @@ com o motor C++/GPU do
 e Vulkan no Windows.
 
 **Versão 0.1.0.** Testada no After Effects e no Premiere Pro no macOS (Apple
-Silicon). O build do Windows está escrito e revisado contra erros de
-compilação, mas ainda não rodou no Windows. Não há binários publicados: compile
+Silicon) e no Windows 11 (NVIDIA, Vulkan). Não há binários publicados: compile
 a partir do código-fonte.
 
 ## O que faz
