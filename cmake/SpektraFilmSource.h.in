@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr char kSpektraFilmSource[] = R"SPK_FILM(@SPEKTRA_FILM_SOURCE@)SPK_FILM";

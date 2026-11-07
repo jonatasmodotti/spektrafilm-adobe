@@ -1,0 +1,2550 @@
+diff --git a/shaders/SpektraFilm.metal b/shaders/SpektraFilm.metal
+index 4dc73e8..fc945fa 100644
+--- a/shaders/SpektraFilm.metal
++++ b/shaders/SpektraFilm.metal
+@@ -172,7 +172,7 @@ struct SpektraKernelParams {
+   float scannerUnsharpAmount;
+   uint densityCurveLookupMode;
+   uint spectralTransmittanceMode;
+-  uint _padPerf0;
++  uint grainPreciseMath;
+   float time;
+ };
+ 
+@@ -320,17 +320,20 @@ static float2 spektra_output_pixel_film_um(
+ ) {
+   const float scale = max(params.enlargerScale, 1.0);
+   const float2 safeDims = float2(max(dims.x, 1u), max(dims.y, 1u));
+-  const float2 outputUv = (float2(gid) + 0.5) / safeDims;
++  const float2 outputUv = precise::divide(float2(gid) + 0.5, safeDims);
+   const float2 sourceUv = float2(0.5) +
+-    (outputUv - float2(0.5)) / scale +
+-    float2(params.enlargerOffsetXPercent, params.enlargerOffsetYPercent) * (0.01 / scale);
++    precise::divide(outputUv - float2(0.5), float2(scale)) +
++    float2(params.enlargerOffsetXPercent, params.enlargerOffsetYPercent) * precise::divide(0.01, scale);
+   const float framePixelSizeUm = max(params.filmPixelSizeUm * scale, 1.0e-6);
+   return sourceUv * safeDims * framePixelSizeUm;
+ }
+ 
++// Grain cell coordinates are quantized with floor(), so one ulp in the film position
++// or cell size moves pixels to another cell and another random sample. They use
++// precise division and square roots even when the library compiles fast math functions.
+ static uint spektra_film_cell_seed(float2 filmUm, float cellSizeUm, uint seed) {
+   const float safeCellSize = max(cellSizeUm, 1.0e-4);
+-  const int2 cell = int2(floor(filmUm / safeCellSize));
++  const int2 cell = int2(floor(precise::divide(filmUm, float2(safeCellSize))));
+   return spektra_hash(seed ^ (uint(cell.x) * 0x1f123bb5u) ^ (uint(cell.y) * 0x5f356495u));
+ }
+ 
+@@ -382,6 +385,19 @@ static float spektra_gaussian(uint seed) {
+   return sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+ }
+ 
++// Box-Muller with fast transcendentals even where the library compiles precise math
++// functions (macOS before 15), unless params.grainPreciseMath (SPEKTRAFILM_PRECISE_MATH)
++// asks for the precise one. The noise differs by float rounding only (about 1e-6 in
++// final output), and the per-pixel preview grain costs half as much.
++static float spektra_grain_gaussian(uint seed, constant SpektraKernelParams &params) {
++  if (params.grainPreciseMath != 0u) {
++    return spektra_gaussian(seed);
++  }
++  const float u1 = max(spektra_rand01(seed), 1.0e-6);
++  const float u2 = spektra_rand01(seed ^ 0x9e3779b9u);
++  return fast::sqrt(-2.0 * fast::log(u1)) * fast::cos(6.28318530718 * u2);
++}
++
+ static float spektra_mitchell_weight(float t) {
+   constexpr float B = 1.0 / 3.0;
+   constexpr float C = 1.0 / 3.0;
+@@ -1031,7 +1047,7 @@ static float spektra_particle_developed_density(
+   float particles,
+   float uniformity,
+   float blurDamping,
+-  uint seed
++  float gaussianSample
+ ) {
+   const float safeDensityMax = max(densityMax, 1.0e-6);
+   const float safeParticles = max(particles, 1.0e-3);
+@@ -1040,7 +1056,7 @@ static float spektra_particle_developed_density(
+   const float expectedSeeds = safeParticles / saturation;
+   const float expectedDeveloped = expectedSeeds * probability;
+   const float variance = max(expectedSeeds * probability, 1.0e-6);
+-  const float developed = clamp(expectedDeveloped + sqrt(variance) * spektra_gaussian(seed) * blurDamping, 0.0, expectedSeeds);
++  const float developed = clamp(expectedDeveloped + sqrt(variance) * gaussianSample * blurDamping, 0.0, expectedSeeds);
+   return developed * (safeDensityMax / safeParticles) * saturation;
+ }
+ 
+@@ -1056,11 +1072,18 @@ static float spektra_density_curve_max(
+   return max(maximum, 1.0e-6);
+ }
+ 
++// Host-computed maximum of the film density curves, floored as in
++// spektra_density_curve_max. Valid for the film curve buffer, not DIR-corrected curves.
++static float3 spektra_film_density_curve_maximum(constant SpektraSpectralInfo &info) {
++  return max(float3(info.filmDensityCurveMaximum0, info.filmDensityCurveMaximum1, info.filmDensityCurveMaximum2), float3(1.0e-6));
++}
++
++// densityCurveMaximum is spektra_density_curve_max per channel. It is a frame
++// invariant, so callers hoist the scan over the curve out of the pixel loop.
+ static float3 spektra_preview_grain_density(
+   float3 densityCmy,
+   constant SpektraKernelParams &params,
+-  constant SpektraCurveInfo &curveInfo,
+-  device const float *densityCurves,
++  float3 densityCurveMaximum,
+   float2 filmUm,
+   uint baseSeed
+ ) {
+@@ -1072,7 +1095,7 @@ static float3 spektra_preview_grain_density(
+ 
+   for (uint channel = 0u; channel < 3u; ++channel) {
+     const float densityMin = spektra_channel_density_min(channel, params);
+-    const float densityMax = spektra_density_curve_max(channel, curveInfo, densityCurves) + densityMin;
++    const float densityMax = densityCurveMaximum[channel] + densityMin;
+     const float particleArea = max(params.grainParticleAreaUm2 * spektra_channel_particle_scale(channel, params), 1.0e-4);
+     const float particles = max(pixelArea / particleArea / max(float(layerCount), 1.0), 1.0e-3);
+     const float sourceDensity = max(spektra_channel_component(densityCmy, channel) + densityMin, 0.0);
+@@ -1080,7 +1103,7 @@ static float3 spektra_preview_grain_density(
+     for (uint layer = 0u; layer < layerCount; ++layer) {
+       const uint particleSeed = spektra_film_cell_seed(
+         filmUm,
+-        sqrt(particleArea),
++        precise::sqrt(particleArea),
+         baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+       );
+       accumulated += spektra_particle_developed_density(
+@@ -1089,7 +1112,7 @@ static float3 spektra_preview_grain_density(
+         particles,
+         spektra_channel_uniformity(channel, params),
+         blurDamping,
+-        particleSeed
++        spektra_grain_gaussian(particleSeed, params)
+       );
+     }
+     accumulated /= max(float(layerCount), 1.0);
+@@ -1154,7 +1177,8 @@ static float3 spektra_production_grain_density(
+   uint baseSeed
+ ) {
+   if (params.grainSublayersEnabled == 0u) {
+-    return spektra_preview_grain_density(densityCmy, params, curveInfo, densityCurves, filmUm, baseSeed);
++    return spektra_preview_grain_density(densityCmy, params,
++      float3(spektra_density_curve_max(0u, curveInfo, densityCurves), spektra_density_curve_max(1u, curveInfo, densityCurves), spektra_density_curve_max(2u, curveInfo, densityCurves)), filmUm, baseSeed);
+   }
+ 
+   float3 outDensity = float3(0.0);
+@@ -1195,7 +1219,7 @@ static float3 spektra_production_grain_density(
+       const float particles = max(pixelArea * layerFraction / particleArea, 1.0e-3);
+       const uint particleSeed = spektra_film_cell_seed(
+         filmUm,
+-        sqrt(particleArea),
++        precise::sqrt(particleArea),
+         baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+       );
+       channelDensity += spektra_particle_developed_density(
+@@ -1204,7 +1228,7 @@ static float3 spektra_production_grain_density(
+         particles,
+         uniformity,
+         blurDamping,
+-        particleSeed
++        spektra_gaussian(particleSeed)
+       );
+     }
+ 
+@@ -1252,7 +1276,8 @@ static float3 spektra_apply_grain_to_density(
+       baseSeed
+     );
+   } else {
+-    grainedDensity = spektra_preview_grain_density(densityCmy, params, curveInfo, densityCurves, filmUm, baseSeed);
++    grainedDensity = spektra_preview_grain_density(densityCmy, params,
++      float3(spektra_density_curve_max(0u, curveInfo, densityCurves), spektra_density_curve_max(1u, curveInfo, densityCurves), spektra_density_curve_max(2u, curveInfo, densityCurves)), filmUm, baseSeed);
+   }
+   return spektra_apply_grain_controls(densityCmy, grainedDensity, params);
+ }
+@@ -1434,10 +1459,14 @@ static float spektra_interp_density_curve(
+ static float3 spektra_hanatos_raw(
+   float3 xyz,
+   constant SpektraSpectralInfo &info,
+-  device const float4 *hanatosRawResponseLut
++  device const float4 *hanatosRawResponseLut,
++  bool clampXy = true
+ ) {
+   const float b = xyz.x + xyz.y + xyz.z;
+-  const float2 xy = clamp(xyz.xy / max(b, 1.0e-10), float2(0.0), float2(1.0));
++  // spektrafilm clamps xy only without input gamut compression (eac6b85);
++  // the tc clamps below keep the lookup in bounds either way.
++  const float2 xyRaw = xyz.xy / max(b, 1.0e-10);
++  const float2 xy = clampXy ? clamp(xyRaw, float2(0.0), float2(1.0)) : xyRaw;
+   const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+   const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+   const float xCoord = tx * float(info.hanatosWidth - 1u);
+@@ -1505,10 +1534,9 @@ static float3 spektra_film_raw_from_decoded(
+   } else {
+     const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
+     device const float4 *packedHanatosSpectraLut = (device const float4 *)hanatosSpectraLut;
+-    const uint compressedOffset = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression)
+-      ? info.hanatosWidth * info.hanatosHeight
+-      : 0u;
+-    raw = spektra_hanatos_raw(xyz, info, packedHanatosSpectraLut + compressedOffset);
++    const bool inputCompression = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression);
++    const uint compressedOffset = inputCompression ? info.hanatosWidth * info.hanatosHeight : 0u;
++    raw = spektra_hanatos_raw(xyz, info, packedHanatosSpectraLut + compressedOffset, !inputCompression);
+   }
+   return max(raw * exp2(params.filmExposureEv + params.autoExposureEv), float3(0.0));
+ }
+@@ -2980,7 +3008,7 @@ static float spektra_production_layer_particle_density(
+     for (uint subLayer = 0u; subLayer < subLayerCount; ++subLayer) {
+       const uint particleSeed = spektra_film_cell_seed(
+         filmUm,
+-        sqrt(particleArea),
++        precise::sqrt(particleArea),
+         baseSeed ^ (channel * 0x85ebca6bu) ^ (subLayer * 0x9e3779b9u)
+       );
+       accumulated += spektra_particle_developed_density(
+@@ -2989,7 +3017,7 @@ static float spektra_production_layer_particle_density(
+         particles,
+         uniformity,
+         1.0,
+-        particleSeed
++        spektra_gaussian(particleSeed)
+       );
+     }
+     return max(accumulated / max(float(subLayerCount), 1.0) - densityMin, 0.0);
+@@ -3018,7 +3046,7 @@ static float spektra_production_layer_particle_density(
+   const float particles = max(pixelArea * layerFraction / particleArea, 1.0e-3);
+   const uint particleSeed = spektra_film_cell_seed(
+     filmUm,
+-    sqrt(particleArea),
++    precise::sqrt(particleArea),
+     baseSeed ^ (channel * 0x85ebca6bu) ^ (layer * 0xc2b2ae35u)
+   );
+   return spektra_particle_developed_density(
+@@ -3027,7 +3055,7 @@ static float spektra_production_layer_particle_density(
+     particles,
+     uniformity,
+     1.0,
+-    particleSeed
++    spektra_gaussian(particleSeed)
+   );
+ }
+ 
+@@ -3097,10 +3125,10 @@ static float4 spektra_source_sample_black_outside(
+ ) {
+   const float scale = max(params.enlargerScale, 1.0);
+   const float2 safeDims = float2(max(dims.x, 1u), max(dims.y, 1u));
+-  const float2 outputUv = (float2(gid) + 0.5) / safeDims;
++  const float2 outputUv = precise::divide(float2(gid) + 0.5, safeDims);
+   const float2 sourceUv = float2(0.5) +
+-    (outputUv - float2(0.5)) / scale +
+-    float2(params.enlargerOffsetXPercent, params.enlargerOffsetYPercent) * (0.01 / scale);
++    precise::divide(outputUv - float2(0.5), float2(scale)) +
++    float2(params.enlargerOffsetXPercent, params.enlargerOffsetYPercent) * precise::divide(0.01, scale);
+ 
+   if (sourceUv.x < 0.0 || sourceUv.x > 1.0 || sourceUv.y < 0.0 || sourceUv.y > 1.0) {
+     return float4(0.0, 0.0, 0.0, 1.0);
+@@ -3854,10 +3882,14 @@ static float4 spektra_channel_gaussian_sample_x(
+   const float3 ratioStep = exp(-invSigma2);
+   float4 value = spektra_float4_buffer_sample(source, width, height, x, y);
+   float3 weightSum = float3(1.0);
++  // Mirrored indexing is the identity away from the edges; skip its modulo there.
++  const uint index = gid.y * width + gid.x;
++  const bool interior = x >= radius && x + radius < int(width);
+   for (int offset = 1; offset <= radius; ++offset) {
+-    const float4 samplePair =
+-      spektra_float4_buffer_sample(source, width, height, x - offset, y) +
+-      spektra_float4_buffer_sample(source, width, height, x + offset, y);
++    const float4 samplePair = interior
++      ? source[index - uint(offset)] + source[index + uint(offset)]
++      : spektra_float4_buffer_sample(source, width, height, x - offset, y) +
++        spektra_float4_buffer_sample(source, width, height, x + offset, y);
+     value.rgb += samplePair.rgb * weight;
+     value.a += samplePair.a;
+     weightSum += 2.0 * weight;
+@@ -3890,10 +3922,15 @@ static float4 spektra_channel_gaussian_sample_y(
+   const float3 ratioStep = exp(-invSigma2);
+   float4 value = spektra_float4_buffer_sample(source, width, height, x, y);
+   float3 weightSum = float3(1.0);
++  // Mirrored indexing is the identity away from the edges; skip its modulo there.
++  const uint index = gid.y * width + gid.x;
++  const bool interior = y >= radius && y + radius < int(height);
+   for (int offset = 1; offset <= radius; ++offset) {
+-    const float4 samplePair =
+-      spektra_float4_buffer_sample(source, width, height, x, y - offset) +
+-      spektra_float4_buffer_sample(source, width, height, x, y + offset);
++    const uint stride = uint(offset) * width;
++    const float4 samplePair = interior
++      ? source[index - stride] + source[index + stride]
++      : spektra_float4_buffer_sample(source, width, height, x, y - offset) +
++        spektra_float4_buffer_sample(source, width, height, x, y + offset);
+     value.rgb += samplePair.rgb * weight;
+     value.a += samplePair.a;
+     weightSum += 2.0 * weight;
+@@ -3905,6 +3942,154 @@ static float4 spektra_channel_gaussian_sample_y(
+   return value;
+ }
+ 
++// Adobe host frames (Adobe port): float32 or float16 RGBA/BGRA/ARGB, straight or
++// premultiplied alpha, with row padding and a start offset. Matches AdobeHostLayout in
++// SpektraMetalRenderer.h. Loads return straight RGBA; stores take straight RGB and
++// the alpha to write.
++struct SpektraAdobeHostLayout {
++  ulong rowComponents;
++  ulong offsetComponents;
++  uint width;
++  uint height;
++  uint order;
++  uint premultiplied;
++  uint halfPrecision;
++  uint reserved;
++};
++
++static float4 spektra_adobe_host_load(device const uchar *source, constant SpektraAdobeHostLayout &layout, uint2 p) {
++  const ulong i = layout.offsetComponents + ulong(p.y) * layout.rowComponents + ulong(p.x) * 4;
++  device const float *f = reinterpret_cast<device const float *>(source);
++  device const half *h = reinterpret_cast<device const half *>(source);
++  float4 v = layout.halfPrecision ? float4(h[i], h[i + 1], h[i + 2], h[i + 3]) : float4(f[i], f[i + 1], f[i + 2], f[i + 3]);
++  if (layout.order == 1u) {
++    v = v.bgra;
++  } else if (layout.order == 2u) {
++    v = v.yzwx;
++  }
++  if (layout.premultiplied) {
++    v.rgb = v.a > 0.0f ? precise::divide(v.rgb, float3(v.a)) : float3(0.0f);
++  }
++  return v;
++}
++
++static void spektra_adobe_host_store(device uchar *destination, constant SpektraAdobeHostLayout &layout, uint2 p, float4 v) {
++  if (layout.premultiplied) {
++    v.rgb = v.a > 0.0f ? v.rgb * v.a : float3(0.0f);
++  }
++  if (layout.order == 1u) {
++    v = v.bgra;
++  } else if (layout.order == 2u) {
++    v = v.wxyz;
++  }
++  const ulong i = layout.offsetComponents + ulong(p.y) * layout.rowComponents + ulong(p.x) * 4;
++  if (layout.halfPrecision) {
++    device half *h = reinterpret_cast<device half *>(destination);
++    h[i] = half(v.x);
++    h[i + 1] = half(v.y);
++    h[i + 2] = half(v.z);
++    h[i + 3] = half(v.w);
++  } else {
++    device float *f = reinterpret_cast<device float *>(destination);
++    f[i] = v.x;
++    f[i + 1] = v.y;
++    f[i + 2] = v.z;
++    f[i + 3] = v.w;
++  }
++}
++
++kernel void spektrafilm_adobe_host_unpack(
++  device const uchar *source [[buffer(0)]],
++  device float4 *rgba [[buffer(1)]],
++  constant SpektraAdobeHostLayout &layout [[buffer(2)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= layout.width || gid.y >= layout.height) {
++    return;
++  }
++  rgba[gid.y * layout.width + gid.x] = spektra_adobe_host_load(source, layout, gid);
++}
++
++// Writes rendered RGB with the source alpha, as the host expects alpha untouched.
++kernel void spektrafilm_adobe_host_pack(
++  device const float4 *rendered [[buffer(0)]],
++  device const uchar *hostSource [[buffer(1)]],
++  device uchar *destination [[buffer(2)]],
++  constant SpektraAdobeHostLayout &sourceLayout [[buffer(3)]],
++  constant SpektraAdobeHostLayout &destinationLayout [[buffer(4)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= destinationLayout.width || gid.y >= destinationLayout.height) {
++    return;
++  }
++  const float alpha = spektra_adobe_host_load(hostSource, sourceLayout, gid).a;
++  spektra_adobe_host_store(destination, destinationLayout, gid,
++    float4(rendered[gid.y * destinationLayout.width + gid.x].rgb, alpha));
++}
++
++// Register-blocked vertical gaussian: one thread computes kSpektraBlurBlockY
++// consecutive rows and slides a window of samples through registers, so each offset
++// costs two loads for the whole block instead of two per output. The per-output
++// arithmetic and its order match spektra_channel_gaussian_sample_y; blocks that touch
++// the top or bottom edge use that function, so results are bit-identical.
++constant constexpr int kSpektraBlurBlockY = 4;
++
++static void spektra_channel_gaussian_block_y(
++  device const float4 *source,
++  uint width,
++  uint height,
++  uint2 blockStart,
++  float3 sigma,
++  thread float4 *out
++) {
++  const int start = int(blockStart.y);
++  const float maxSigma = spektra_max3(sigma);
++  const int radius = maxSigma <= 1.0e-4 ? 0 : min(int(ceil(3.0 * maxSigma)), 256);
++  if (maxSigma <= 1.0e-4 || start < radius || start + kSpektraBlurBlockY - 1 + radius >= int(height)) {
++    for (int k = 0; k < kSpektraBlurBlockY && start + k < int(height); ++k) {
++      out[k] = spektra_channel_gaussian_sample_y(source, width, height, uint2(blockStart.x, blockStart.y + uint(k)), sigma);
++    }
++    return;
++  }
++  device const float4 *base = source + blockStart.y * width + blockStart.x;
++  const float3 safeSigma = max(sigma, float3(1.0e-6));
++  const float3 invSigma2 = 1.0 / max(safeSigma * safeSigma, float3(1.0e-8));
++  float3 weight = exp(-0.5 * invSigma2);
++  float3 ratio = exp(-1.5 * invSigma2);
++  const float3 ratioStep = exp(-invSigma2);
++  float3 weightSum = float3(1.0);
++  float4 above[kSpektraBlurBlockY];
++  float4 below[kSpektraBlurBlockY];
++  for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++    out[k] = base[uint(k) * width];
++    above[k] = out[k];
++    below[k] = out[k];
++  }
++  for (int offset = 1; offset <= radius; ++offset) {
++    // above[k] = row (start + k - offset), below[k] = row (start + k + offset).
++    for (int k = kSpektraBlurBlockY - 1; k > 0; --k) {
++      above[k] = above[k - 1];
++    }
++    above[0] = *(base - uint(offset) * width);
++    for (int k = 0; k < kSpektraBlurBlockY - 1; ++k) {
++      below[k] = below[k + 1];
++    }
++    below[kSpektraBlurBlockY - 1] = base[uint(kSpektraBlurBlockY - 1 + offset) * width];
++    for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++      const float4 samplePair = above[k] + below[k];
++      out[k].rgb += samplePair.rgb * weight;
++      out[k].a += samplePair.a;
++    }
++    weightSum += 2.0 * weight;
++    weight *= ratio;
++    ratio *= ratioStep;
++  }
++  for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++    out[k].rgb /= max(weightSum, float3(1.0e-8));
++    out[k].a /= float(radius * 2 + 1);
++  }
++}
++
+ kernel void spektrafilm_halation_raw_exposure(
+   device const float4 *source [[buffer(0)]],
+   device float4 *rawOut [[buffer(1)]],
+@@ -3946,6 +4131,49 @@ kernel void spektrafilm_halation_raw_exposure(
+   );
+ }
+ 
++// Raw exposure read straight from an Adobe host frame (replaces unpack + raw exposure).
++kernel void spektrafilm_halation_raw_exposure_adobe_host(
++  device const uchar *source [[buffer(0)]],
++  device float4 *rawOut [[buffer(1)]],
++  constant SpektraKernelParams &params [[buffer(2)]],
++  constant uint2 &dims [[buffer(3)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
++  device const float *logSensitivity [[buffer(5)]],
++  device const float *bandpassHanatos2025 [[buffer(6)]],
++  device const float *hanatosSpectraLut [[buffer(7)]],
++  device const float *mallettBasisIlluminant [[buffer(8)]],
++  device const float *inputToReferenceXyz [[buffer(9)]],
++  device const float *inputToSrgb [[buffer(10)]],
++  constant SpektraColorInfo &colorInfo [[buffer(11)]],
++  device const float *decodeLuts [[buffer(12)]],
++  device const uint *transferKinds [[buffer(13)]],
++  constant SpektraAdobeHostLayout &sourceLayout [[buffer(14)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= dims.x || gid.y >= dims.y) {
++    return;
++  }
++  const uint index = gid.y * dims.x + gid.x;
++  const float4 sourcePixel = spektra_adobe_host_load(source, sourceLayout, gid);
++  rawOut[index] = float4(
++    spektra_film_raw(
++      sourcePixel.rgb,
++      params,
++      colorInfo,
++      spectralInfo,
++      logSensitivity,
++      bandpassHanatos2025,
++      hanatosSpectraLut,
++      mallettBasisIlluminant,
++      inputToReferenceXyz,
++      inputToSrgb,
++      decodeLuts,
++      transferKinds
++    ),
++    sourcePixel.a
++  );
++}
++
+ kernel void spektrafilm_halation_boost_max(
+   device const float4 *rawIn [[buffer(0)]],
+   device float *maxOut [[buffer(1)]],
+@@ -4106,7 +4334,9 @@ kernel void spektrafilm_halation_scatter_tail_blur_y(
+   const uint index = gid.y * dims.x + gid.x;
+   const float4 blurred = spektra_channel_gaussian_sample_y(
+     rawIn, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, component));
+-  rawOut[index] = float4(rawOut[index].rgb + spektra_halation_scatter_tail_weight(component) * blurred.rgb, blurred.a);
++  // Component 0 starts the sum, so the accumulator needs no separate clear pass.
++  const float3 prior = component == 0u ? float3(0.0) : rawOut[index].rgb;
++  rawOut[index] = float4(prior + spektra_halation_scatter_tail_weight(component) * blurred.rgb, blurred.a);
+ }
+ 
+ kernel void spektrafilm_halation_scatter_tail_group_blur_x(
+@@ -4147,8 +4377,9 @@ kernel void spektrafilm_halation_scatter_tail_group_blur_y(
+     tailIn + pixelCount, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 1u));
+   const float4 blurred2 = spektra_channel_gaussian_sample_y(
+     tailIn + pixelCount * 2u, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 2u));
++  // This kernel writes the whole tail sum, so the accumulator needs no clear pass.
+   accumInOut[index] = float4(
+-    accumInOut[index].rgb +
++    float3(0.0) +
+       spektra_halation_scatter_tail_weight(0u) * blurred0.rgb +
+       spektra_halation_scatter_tail_weight(1u) * blurred1.rgb +
+       spektra_halation_scatter_tail_weight(2u) * blurred2.rgb,
+@@ -4156,6 +4387,46 @@ kernel void spektrafilm_halation_scatter_tail_group_blur_y(
+   );
+ }
+ 
++// Grouped tail Y blur with the scatter resolve folded in: the tail sum stays in
++// registers instead of going through an accumulator buffer and a resolve pass. The
++// tail sum and resolve expressions are those of scatter_tail_group_blur_y and
++// scatter_resolve, so the output is bit-identical to running both.
++kernel void spektrafilm_halation_scatter_tail_group_blur_y_resolve(
++  device const float4 *tailIn [[buffer(0)]],
++  device const float4 *rawIn [[buffer(1)]],
++  device const float4 *coreIn [[buffer(2)]],
++  device float4 *rawOut [[buffer(3)]],
++  constant SpektraKernelParams &params [[buffer(4)]],
++  constant uint2 &dims [[buffer(5)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  const uint2 blockStart = uint2(gid.x, gid.y * uint(kSpektraBlurBlockY));
++  if (blockStart.x >= dims.x || blockStart.y >= dims.y) {
++    return;
++  }
++  const uint pixelCount = dims.x * dims.y;
++  float4 blurred0[kSpektraBlurBlockY];
++  float4 blurred1[kSpektraBlurBlockY];
++  float4 blurred2[kSpektraBlurBlockY];
++  spektra_channel_gaussian_block_y(tailIn, dims.x, dims.y, blockStart,
++    spektra_halation_scatter_tail_sigma(params, 0u), blurred0);
++  spektra_channel_gaussian_block_y(tailIn + pixelCount, dims.x, dims.y, blockStart,
++    spektra_halation_scatter_tail_sigma(params, 1u), blurred1);
++  spektra_channel_gaussian_block_y(tailIn + pixelCount * 2u, dims.x, dims.y, blockStart,
++    spektra_halation_scatter_tail_sigma(params, 2u), blurred2);
++  constexpr float3 kScatterTailWeight = float3(0.78, 0.65, 0.67);
++  for (int k = 0; k < kSpektraBlurBlockY && blockStart.y + uint(k) < dims.y; ++k) {
++    const uint index = (blockStart.y + uint(k)) * dims.x + blockStart.x;
++    const float3 tail = float3(0.0) +
++      spektra_halation_scatter_tail_weight(0u) * blurred0[k].rgb +
++      spektra_halation_scatter_tail_weight(1u) * blurred1[k].rgb +
++      spektra_halation_scatter_tail_weight(2u) * blurred2[k].rgb;
++    const float4 raw = rawIn[index];
++    const float3 scattered = (1.0 - kScatterTailWeight) * coreIn[index].rgb + kScatterTailWeight * tail;
++    rawOut[index] = float4((1.0 - params.scatterAmount) * raw.rgb + params.scatterAmount * scattered, raw.a);
++  }
++}
++
+ kernel void spektrafilm_halation_scatter_resolve(
+   device const float4 *rawIn [[buffer(0)]],
+   device const float4 *coreIn [[buffer(1)]],
+@@ -4211,16 +4482,22 @@ kernel void spektrafilm_halation_bounce_blur_y_accumulate(
+   constant uint &bounce [[buffer(4)]],
+   uint2 gid [[thread_position_in_grid]]
+ ) {
+-  if (gid.x >= dims.x || gid.y >= dims.y) {
++  // One thread per kSpektraBlurBlockY rows; see spektra_channel_gaussian_block_y.
++  const uint2 blockStart = uint2(gid.x, gid.y * uint(kSpektraBlurBlockY));
++  if (blockStart.x >= dims.x || blockStart.y >= dims.y) {
+     return;
+   }
+   constexpr float kHalationBounceDecay = 0.5;
+   constexpr float kHalationDecaySum3 = 1.75;
+   const float weight = pow(kHalationBounceDecay, float(bounce)) / kHalationDecaySum3;
+-  const uint index = gid.y * dims.x + gid.x;
+-  const float4 blurred = spektra_channel_gaussian_sample_y(
+-    rawIn, dims.x, dims.y, gid, spektra_halation_first_sigma(params, bounce));
+-  accumInOut[index] = float4(accumInOut[index].rgb + weight * blurred.rgb, blurred.a);
++  float4 blurred[kSpektraBlurBlockY];
++  spektra_channel_gaussian_block_y(rawIn, dims.x, dims.y, blockStart, spektra_halation_first_sigma(params, bounce), blurred);
++  for (int k = 0; k < kSpektraBlurBlockY && blockStart.y + uint(k) < dims.y; ++k) {
++    const uint index = (blockStart.y + uint(k)) * dims.x + blockStart.x;
++    // Bounce 0 starts the sum, so the accumulator needs no separate clear pass.
++    const float3 prior = bounce == 0u ? float3(0.0) : accumInOut[index].rgb;
++    accumInOut[index] = float4(prior + weight * blurred[k].rgb, blurred[k].a);
++  }
+ }
+ 
+ kernel void spektrafilm_halation_resolve_log_raw(
+@@ -4573,6 +4850,55 @@ static float4 spektra_scalar_gaussian_sample_y_info(
+   return value * info.invWeightSum;
+ }
+ 
++// kSpektraBlurBlockY consecutive rows of spektra_scalar_gaussian_sample_y_info, with
++// one register sliding window per column. Same terms in the same order: bit-identical.
++static void spektra_scalar_gaussian_block_y_info(
++  device const float4 *source,
++  uint width,
++  uint height,
++  uint2 blockStart,
++  SpektraGaussianBlurInfo info,
++  thread float4 *out
++) {
++  const int start = int(blockStart.y);
++  const int radius = int(info.radius);
++  if (info.active == 0u || radius == 0 || start < radius || start + kSpektraBlurBlockY - 1 + radius >= int(height)) {
++    for (int k = 0; k < kSpektraBlurBlockY && start + k < int(height); ++k) {
++      out[k] = spektra_scalar_gaussian_sample_y_info(source, width, height, uint2(blockStart.x, blockStart.y + uint(k)), info);
++    }
++    return;
++  }
++  device const float4 *base = source + blockStart.y * width + blockStart.x;
++  float weight = info.firstWeight;
++  float ratio = info.firstRatio;
++  float4 above[kSpektraBlurBlockY];
++  float4 below[kSpektraBlurBlockY];
++  for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++    out[k] = base[uint(k) * width];
++    above[k] = out[k];
++    below[k] = out[k];
++  }
++  for (int offset = 1; offset <= radius; ++offset) {
++    // above[k] = row (start + k - offset), below[k] = row (start + k + offset).
++    for (int k = kSpektraBlurBlockY - 1; k > 0; --k) {
++      above[k] = above[k - 1];
++    }
++    above[0] = *(base - uint(offset) * width);
++    for (int k = 0; k < kSpektraBlurBlockY - 1; ++k) {
++      below[k] = below[k + 1];
++    }
++    below[kSpektraBlurBlockY - 1] = base[uint(kSpektraBlurBlockY - 1 + offset) * width];
++    for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++      out[k] += weight * (above[k] + below[k]);
++    }
++    weight *= ratio;
++    ratio *= info.ratioStep;
++  }
++  for (int k = 0; k < kSpektraBlurBlockY; ++k) {
++    out[k] = out[k] * info.invWeightSum;
++  }
++}
++
+ static float4 spektra_scalar_gaussian_sample_x_limited(
+   device const float4 *source,
+   uint width,
+@@ -4710,27 +5036,6 @@ kernel void spektrafilm_diffusion_component_blur_x(
+     source, dims.x, dims.y, gid, max(component.sigmaPx, 1.0e-6));
+ }
+ 
+-kernel void spektrafilm_diffusion_component_blur_y_accumulate(
+-  device const float4 *tempIn [[buffer(0)]],
+-  device float4 *accumInOut [[buffer(1)]],
+-  device const SpektraDiffusionComponent *components [[buffer(2)]],
+-  constant uint2 &dims [[buffer(3)]],
+-  constant uint &componentIndex [[buffer(4)]],
+-  uint2 gid [[thread_position_in_grid]]
+-) {
+-  if (gid.x >= dims.x || gid.y >= dims.y) {
+-    return;
+-  }
+-  const SpektraDiffusionComponent component = components[componentIndex];
+-  const uint index = gid.y * dims.x + gid.x;
+-  const float4 blurred = spektra_scalar_gaussian_sample_y(
+-    tempIn, dims.x, dims.y, gid, max(component.sigmaPx, 1.0e-6));
+-  accumInOut[index] = float4(
+-    accumInOut[index].rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+-    blurred.a
+-  );
+-}
+-
+ kernel void spektrafilm_diffusion_group_blur_x(
+   device const float4 *source [[buffer(0)]],
+   device float4 *tempOut [[buffer(1)]],
+@@ -4765,30 +5070,40 @@ kernel void spektrafilm_diffusion_group_blur_y_accumulate(
+   constant uint2 &componentRange [[buffer(4)]],
+   uint2 gid [[thread_position_in_grid]]
+ ) {
+-  if (gid.x >= dims.x || gid.y >= dims.y) {
++  // One thread per column and kSpektraBlurBlockY rows (dispatched as blurBlocksY).
++  const uint2 blockStart = uint2(gid.x, gid.y * uint(kSpektraBlurBlockY));
++  if (blockStart.x >= dims.x || blockStart.y >= dims.y) {
+     return;
+   }
+-  const uint index = gid.y * dims.x + gid.x;
++  const uint rows = min(uint(kSpektraBlurBlockY), dims.y - blockStart.y);
+   const uint pixelCount = dims.x * dims.y;
+   const uint componentStart = componentRange.x;
+   const uint groupCount = min(componentRange.y, 4u);
+-  float4 accum = accumInOut[index];
++  float4 accum[kSpektraBlurBlockY];
++  for (uint k = 0u; k < rows; ++k) {
++    accum[k] = accumInOut[(blockStart.y + k) * dims.x + blockStart.x];
++  }
+   for (uint slot = 0u; slot < groupCount; ++slot) {
+     const SpektraDiffusionComponent component = components[componentStart + slot];
+     const float sigma = max(component.sigmaPx, 1.0e-6);
+     device const float4 *plane = tempIn + slot * pixelCount;
+-    float4 blurred;
++    float4 blurred[kSpektraBlurBlockY];
+     if (sigma <= 1.0e-4) {
+-      blurred = plane[index];
++      for (uint k = 0u; k < rows; ++k) {
++        blurred[k] = plane[(blockStart.y + k) * dims.x + blockStart.x];
++      }
+     } else {
+-      blurred = spektra_scalar_gaussian_sample_y(plane, dims.x, dims.y, gid, sigma);
++      spektra_scalar_gaussian_block_y_info(plane, dims.x, dims.y, blockStart,
++        spektra_make_gaussian_blur_info(sigma, 256), blurred);
++    }
++    const float3 weights = float3(component.weightR, component.weightG, component.weightB);
++    for (uint k = 0u; k < rows; ++k) {
++      accum[k] = float4(accum[k].rgb + blurred[k].rgb * weights, blurred[k].a);
+     }
+-    accum = float4(
+-      accum.rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+-      blurred.a
+-    );
+   }
+-  accumInOut[index] = accum;
++  for (uint k = 0u; k < rows; ++k) {
++    accumInOut[(blockStart.y + k) * dims.x + blockStart.x] = accum[k];
++  }
+ }
+ 
+ kernel void spektrafilm_diffusion_downsample(
+@@ -5422,6 +5737,7 @@ kernel void spektrafilm_preview_grain_from_density(
+   constant uint2 &dims [[buffer(3)]],
+   constant SpektraCurveInfo &curveInfo [[buffer(4)]],
+   device const float *densityCurves [[buffer(5)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(6)]],
+   uint2 gid [[thread_position_in_grid]]
+ ) {
+   if (gid.x >= dims.x || gid.y >= dims.y) {
+@@ -5439,7 +5755,7 @@ kernel void spektrafilm_preview_grain_from_density(
+   densityOut[index] = float4(
+     spektra_apply_grain_controls(
+       density.rgb,
+-      spektra_preview_grain_density(density.rgb, params, curveInfo, densityCurves, filmUm, baseSeed),
++      spektra_preview_grain_density(density.rgb, params, spektra_film_density_curve_maximum(spectralInfo), filmUm, baseSeed),
+       params
+     ),
+     density.a
+@@ -6909,6 +7225,343 @@ kernel void spektrafilm_final_from_film_density(
+   destination[index] = pixel;
+ }
+ 
++// Spectral 3D LUTs, as in spektrafilm's use_enlarger_lut/use_scanner_lut.
++// Both spectral integrals have the form sum_l w_l * 10^-(d . s_l), with w_l >= 0,
++// so their log is smooth and nearly linear in d. The LUTs store log2 of the
++// positive integral; every non-spectral step (timing, exposure, paper curve,
++// colour matrix, encoding) stays exact per pixel. Each LUT buffer starts with
++// two float4 headers: (domain minimum, size) and (cells per density unit, error
++// tolerance). Grid entry .w holds, for the cell whose lowest corner it is, the
++// output-space interpolation error measured at the cell centre. Saturated colours near a
++// dye's maximum density switch the dominant spectral band abruptly; cells whose
++// error exceeds the tolerance, inputs outside the domain, and non-finite inputs
++// use the exact integral instead.
++constant uint kSpektraLutHeader = 2u;
++
++static float3 spektra_lut_spectral_sum(
++  float3 densityCmy,
++  uint wavelengthCount,
++  device const float4 *spectralDensity,
++  device const float4 *weights
++) {
++  float3 sum = float3(0.0);
++  for (uint wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
++    sum += spektra_spectral_transmittance_pow(dot(densityCmy, spectralDensity[wavelength].xyz)) *
++      weights[wavelength].xyz;
++  }
++  return sum;
++}
++
++// Domains follow the reference: film from -grain density_min to the film curve
++// maximum, print from zero to the paper curve maximum. The host computes them.
++struct SpektraLutDomain {
++  float4 filmMin;
++  float4 filmMax;
++  float4 printMin;
++  float4 printMax;
++};
++
++static bool spektra_lut_sample(device const float4 *lut, float3 x, thread float3 &value) {
++  const float4 origin = lut[0];
++  const float3 scale = lut[1].xyz;
++  const float last = origin.w - 1.0;
++  const float3 u = (x - origin.xyz) * scale;
++  // Written so that NaN coordinates fail the test.
++  if (!all(u >= float3(0.0)) || !all(u <= float3(last))) {
++    return false;
++  }
++  const float3 cell = min(floor(u), float3(last - 1.0));
++  const float3 f = u - cell;
++  const uint n = uint(origin.w);
++  const uint3 c = uint3(cell);
++  device const float4 *p = lut + kSpektraLutHeader + (c.x * n + c.y) * n + c.z;
++  const float4 base = p[0];
++  if (!(base.w <= lut[1].w)) {
++    return false;
++  }
++  const uint sy = n;
++  const uint sx = n * n;
++  const float3 c00 = mix(base.xyz, p[1].xyz, f.z);
++  const float3 c01 = mix(p[sy].xyz, p[sy + 1u].xyz, f.z);
++  const float3 c10 = mix(p[sx].xyz, p[sx + 1u].xyz, f.z);
++  const float3 c11 = mix(p[sx + sy].xyz, p[sx + sy + 1u].xyz, f.z);
++  value = mix(mix(c00, c01, f.y), mix(c10, c11, f.y), f.x);
++  return true;
++}
++
++static void spektra_lut_write_header(device float4 *lut, float3 minimum, float3 maximum, uint n, float tolerance) {
++  lut[0] = float4(minimum, float(n));
++  lut[1] = float4(float(n - 1u) / max(maximum - minimum, float3(1.0e-6)), tolerance);
++}
++
++static float3 spektra_lut_cell_centre_mean(device const float4 *p, uint n) {
++  const uint sy = n;
++  const uint sx = n * n;
++  return 0.125 * (p[0].xyz + p[1].xyz + p[sy].xyz + p[sy + 1u].xyz +
++                  p[sx].xyz + p[sx + 1u].xyz + p[sx + sy].xyz + p[sx + sy + 1u].xyz);
++}
++
++// gid.x = i * n + j, gid.y = k. Builds both LUTs from the exact integrals.
++kernel void spektrafilm_build_spectral_luts(
++  device float4 *enlargerLut [[buffer(0)]],
++  device float4 *scannerLut [[buffer(1)]],
++  constant SpektraKernelParams &params [[buffer(2)]],
++  constant uint &n [[buffer(3)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
++  constant SpektraLutDomain &domain [[buffer(5)]],
++  constant float2 &tolerance [[buffer(10)]],
++  device const float4 *filmSpectralDensity [[buffer(6)]],
++  device const float4 *filteredEnlargerResponse [[buffer(7)]],
++  device const float4 *paperSpectralDensity [[buffer(8)]],
++  device const float *scanProducts [[buffer(9)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= n * n || gid.y >= n) {
++    return;
++  }
++  const uint3 g = uint3(gid.x / n, gid.x % n, gid.y);
++  const float3 t = float3(g) / float(n - 1u);
++  const float3 filmMin = domain.filmMin.xyz;
++  const float3 filmMax = domain.filmMax.xyz;
++  const float3 printMin = domain.printMin.xyz;
++  const float3 printMax = domain.printMax.xyz;
++  if (all(g == uint3(0u))) {
++    spektra_lut_write_header(enlargerLut, filmMin, filmMax, n, tolerance.x);
++    spektra_lut_write_header(scannerLut, printMin, printMax, n, tolerance.y);
++  }
++  const uint index = kSpektraLutHeader + (g.x * n + g.y) * n + g.z;
++  const uint count = spectralInfo.filmWavelengthCount;
++  const float3 raw = spektra_lut_spectral_sum(mix(filmMin, filmMax, t), count, filmSpectralDensity, filteredEnlargerResponse);
++  device const float4 *paperProducts = (device const float4 *)scanProducts + count;
++  const float3 xyz = spektra_lut_spectral_sum(mix(printMin, printMax, t), count, paperSpectralDensity, paperProducts);
++  // Cells are measured by spektrafilm_measure_spectral_luts; the top faces
++  // have no cell and are never read as a cell base.
++  enlargerLut[index] = float4(log2(max(raw, float3(1.0e-30))), 0.0);
++  scannerLut[index] = float4(log2(max(xyz, float3(1.0e-30))), 0.0);
++}
++
++// Output of the print path from print density, exactly as the LUT kernel
++// finishes it: scan XYZ -> output RGB -> scanner contract -> optional encoding.
++static float3 spektra_lut_print_output(
++  float3 xyz,
++  float inverseNormalization,
++  constant SpektraKernelParams &params,
++  constant SpektraColorInfo &colorInfo,
++  device const float *paperScanToOutputRgb,
++  constant SpektraFrameConstants &frameConstants,
++  device const float *encodeLuts,
++  device const uint *transferKinds,
++  uint encodeOutput
++) {
++  xyz *= inverseNormalization;
++  SpektraScanResult scan = {
++    spektra_mul_color_matrix(xyz, int(spektra_final_output_color_space(params, colorInfo)), colorInfo, paperScanToOutputRgb),
++    xyz.y
++  };
++  float3 rgb = spektra_apply_print_scan_output_contract(scan, frameConstants, params);
++  if (encodeOutput != 0u) {
++    rgb = spektra_finalize_output_rgb(rgb, params, colorInfo, encodeLuts, transferKinds);
++  }
++  return rgb;
++}
++
++static float3 spektra_lut_print_density(
++  float3 raw,
++  constant SpektraKernelParams &params,
++  constant SpektraSpectralInfo &spectralInfo,
++  constant SpektraCurveInfo &paperCurveInfo,
++  device const float *paperLogExposure,
++  device const float *paperDensityCurves,
++  constant SpektraFrameConstants &frameConstants
++) {
++  const float3 rawTimed = raw * frameConstants.print.x + frameConstants.preflash.rgb;
++  const float3 logRaw = log10(max(rawTimed * exp2(params.printExposureEv), float3(0.0)) + float3(1.0e-10));
++  return spektra_develop_print_density(logRaw, params, spectralInfo, paperCurveInfo, paperLogExposure, paperDensityCurves);
++}
++
++static float spektra_max_abs_difference(float3 a, float3 b) {
++  const float3 d = abs(a - b);
++  return isfinite(d.x + d.y + d.z) ? max(max(d.x, d.y), d.z) : INFINITY;
++}
++
++// gid.x = i * (n - 1) + j, gid.y = k over cells. Runs after the build pass and
++// after the frame constants. Stores, per cell, the output-space error of the
++// trilinear value at the cell centre, where that error is typically largest:
++// the enlarger error carried through the exact paper and scan, and the scanner
++// error through the colour matrix, scanner contract and encoding. Measuring in
++// the output space accounts for the matrix cancellation and transfer-curve
++// slope near black that amplify small spectral errors.
++kernel void spektrafilm_measure_spectral_luts(
++  device float4 *enlargerLut [[buffer(0)]],
++  device float4 *scannerLut [[buffer(1)]],
++  constant SpektraKernelParams &params [[buffer(2)]],
++  constant uint &n [[buffer(3)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
++  constant SpektraLutDomain &domain [[buffer(5)]],
++  device const float4 *filmSpectralDensity [[buffer(6)]],
++  device const float4 *filteredEnlargerResponse [[buffer(7)]],
++  device const float4 *paperSpectralDensity [[buffer(8)]],
++  device const float *scanProducts [[buffer(9)]],
++  constant SpektraColorInfo &colorInfo [[buffer(11)]],
++  device const uint *transferKinds [[buffer(12)]],
++  device const float *scanToOutputRgbData [[buffer(13)]],
++  device const float *encodeLuts [[buffer(14)]],
++  constant SpektraFrameConstants &frameConstants [[buffer(15)]],
++  constant uint &encodeOutput [[buffer(16)]],
++  constant SpektraCurveInfo &paperCurveInfo [[buffer(17)]],
++  device const float *paperLogExposure [[buffer(18)]],
++  device const float *paperDensityCurves [[buffer(19)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  const uint cells = n - 1u;
++  if (gid.x >= cells * cells || gid.y >= cells) {
++    return;
++  }
++  const uint3 g = uint3(gid.x / cells, gid.x % cells, gid.y);
++  const float3 t = (float3(g) + 0.5) / float(cells);
++  const uint index = kSpektraLutHeader + (g.x * n + g.y) * n + g.z;
++  const uint count = spectralInfo.filmWavelengthCount;
++  device const float4 *paperProducts = (device const float4 *)scanProducts + count;
++  const float inverseNormalization = (scanProducts + count * 8u)[count * 6u + 1u];
++  device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
++  const float3 rawExact = spektra_lut_spectral_sum(mix(domain.filmMin.xyz, domain.filmMax.xyz, t), count,
++    filmSpectralDensity, filteredEnlargerResponse);
++  const float3 rawLut = exp2(spektra_lut_cell_centre_mean(enlargerLut + index, n));
++  const float3 printExact = spektra_lut_print_density(rawExact, params, spectralInfo, paperCurveInfo,
++    paperLogExposure, paperDensityCurves, frameConstants);
++  const float3 printLut = spektra_lut_print_density(rawLut, params, spectralInfo, paperCurveInfo,
++    paperLogExposure, paperDensityCurves, frameConstants);
++  const float3 xyzExact = spektra_lut_spectral_sum(mix(domain.printMin.xyz, domain.printMax.xyz, t), count,
++    paperSpectralDensity, paperProducts);
++  const float3 xyzLut = exp2(spektra_lut_cell_centre_mean(scannerLut + index, n));
++  const float3 enlargerExact = spektra_lut_print_output(
++    spektra_lut_spectral_sum(printExact, count, paperSpectralDensity, paperProducts), inverseNormalization,
++    params, colorInfo, paperScanToOutputRgb, frameConstants, encodeLuts, transferKinds, encodeOutput);
++  const float3 enlargerApprox = spektra_lut_print_output(
++    spektra_lut_spectral_sum(printLut, count, paperSpectralDensity, paperProducts), inverseNormalization,
++    params, colorInfo, paperScanToOutputRgb, frameConstants, encodeLuts, transferKinds, encodeOutput);
++  const float3 scannerExact = spektra_lut_print_output(xyzExact, inverseNormalization,
++    params, colorInfo, paperScanToOutputRgb, frameConstants, encodeLuts, transferKinds, encodeOutput);
++  const float3 scannerApprox = spektra_lut_print_output(xyzLut, inverseNormalization,
++    params, colorInfo, paperScanToOutputRgb, frameConstants, encodeLuts, transferKinds, encodeOutput);
++  enlargerLut[index].w = spektra_max_abs_difference(enlargerExact, enlargerApprox);
++  scannerLut[index].w = spektra_max_abs_difference(scannerExact, scannerApprox);
++}
++
++// Print simulation (process 0) without bleach bypass or printer-density timing;
++// the host selects the exact kernel otherwise.
++static float4 spektra_final_from_film_density_lut_pixel(
++  float4 pixel,
++  constant SpektraKernelParams &params,
++  constant SpektraSpectralInfo &spectralInfo,
++  constant SpektraColorInfo &colorInfo,
++  device const uint *transferKinds,
++  constant SpektraCurveInfo &paperCurveInfo,
++  device const float *paperLogExposure,
++  device const float *paperDensityCurves,
++  device const float4 *filmSpectralDensity,
++  device const float4 *filteredEnlargerResponse,
++  device const float4 *paperSpectralDensity,
++  device const float *scanProducts,
++  device const float *scanToOutputRgbData,
++  device const float *encodeLuts,
++  constant SpektraFrameConstants &frameConstants,
++  uint encodeOutput,
++  device const float4 *enlargerLut,
++  device const float4 *scannerLut
++) {
++  const uint count = spectralInfo.filmWavelengthCount;
++  device const float *legacyScanProducts = scanProducts + count * 8u;
++  const float paperInverseNormalization = legacyScanProducts[count * 6u + 1u];
++  device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
++
++  float3 logRaw;
++  const float3 raw = spektra_lut_sample(enlargerLut, pixel.rgb, logRaw)
++    ? exp2(logRaw)
++    : spektra_lut_spectral_sum(pixel.rgb, count, filmSpectralDensity, filteredEnlargerResponse);
++  pixel.rgb = spektra_lut_print_density(raw, params, spectralInfo, paperCurveInfo, paperLogExposure, paperDensityCurves, frameConstants);
++
++  float3 logXyz;
++  device const float4 *paperProducts = (device const float4 *)scanProducts + count;
++  const float3 xyz = spektra_lut_sample(scannerLut, pixel.rgb, logXyz)
++    ? exp2(logXyz)
++    : spektra_lut_spectral_sum(pixel.rgb, count, paperSpectralDensity, paperProducts);
++  pixel.rgb = spektra_lut_print_output(xyz, paperInverseNormalization, params, colorInfo, paperScanToOutputRgb,
++    frameConstants, encodeLuts, transferKinds, encodeOutput);
++  return pixel;
++}
++
++kernel void spektrafilm_final_from_film_density_lut(
++  device const float4 *filmDensity [[buffer(0)]],
++  device float4 *destination [[buffer(1)]],
++  constant SpektraKernelParams &params [[buffer(2)]],
++  constant uint2 &dims [[buffer(3)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
++  constant SpektraColorInfo &colorInfo [[buffer(5)]],
++  device const uint *transferKinds [[buffer(6)]],
++  constant SpektraCurveInfo &paperCurveInfo [[buffer(7)]],
++  device const float *paperLogExposure [[buffer(8)]],
++  device const float *paperDensityCurves [[buffer(9)]],
++  device const float4 *filmSpectralDensity [[buffer(10)]],
++  device const float4 *filteredEnlargerResponse [[buffer(11)]],
++  device const float4 *paperSpectralDensity [[buffer(12)]],
++  device const float *scanProducts [[buffer(13)]],
++  device const float *scanToOutputRgbData [[buffer(14)]],
++  device const float *encodeLuts [[buffer(15)]],
++  constant SpektraFrameConstants &frameConstants [[buffer(16)]],
++  constant uint &encodeOutput [[buffer(17)]],
++  device const float4 *enlargerLut [[buffer(18)]],
++  device const float4 *scannerLut [[buffer(19)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= dims.x || gid.y >= dims.y) {
++    return;
++  }
++  const uint index = gid.y * dims.x + gid.x;
++  destination[index] = spektra_final_from_film_density_lut_pixel(filmDensity[index], params, spectralInfo, colorInfo, transferKinds, paperCurveInfo,
++    paperLogExposure, paperDensityCurves, filmSpectralDensity, filteredEnlargerResponse, paperSpectralDensity,
++    scanProducts, scanToOutputRgbData, encodeLuts, frameConstants, encodeOutput, enlargerLut, scannerLut);
++}
++
++// Final LUT written straight into an Adobe host frame with the source alpha
++// (replaces final LUT + pack).
++kernel void spektrafilm_final_from_film_density_lut_adobe_host(
++  device const float4 *filmDensity [[buffer(0)]],
++  device uchar *destination [[buffer(1)]],
++  constant SpektraKernelParams &params [[buffer(2)]],
++  constant uint2 &dims [[buffer(3)]],
++  constant SpektraSpectralInfo &spectralInfo [[buffer(4)]],
++  constant SpektraColorInfo &colorInfo [[buffer(5)]],
++  device const uint *transferKinds [[buffer(6)]],
++  constant SpektraCurveInfo &paperCurveInfo [[buffer(7)]],
++  device const float *paperLogExposure [[buffer(8)]],
++  device const float *paperDensityCurves [[buffer(9)]],
++  device const float4 *filmSpectralDensity [[buffer(10)]],
++  device const float4 *filteredEnlargerResponse [[buffer(11)]],
++  device const float4 *paperSpectralDensity [[buffer(12)]],
++  device const float *scanProducts [[buffer(13)]],
++  device const float *scanToOutputRgbData [[buffer(14)]],
++  device const float *encodeLuts [[buffer(15)]],
++  constant SpektraFrameConstants &frameConstants [[buffer(16)]],
++  constant uint &encodeOutput [[buffer(17)]],
++  device const float4 *enlargerLut [[buffer(18)]],
++  device const float4 *scannerLut [[buffer(19)]],
++  device const uchar *hostSource [[buffer(20)]],
++  constant SpektraAdobeHostLayout &sourceLayout [[buffer(21)]],
++  constant SpektraAdobeHostLayout &destinationLayout [[buffer(22)]],
++  uint2 gid [[thread_position_in_grid]]
++) {
++  if (gid.x >= dims.x || gid.y >= dims.y) {
++    return;
++  }
++  const uint index = gid.y * dims.x + gid.x;
++  const float4 pixel = spektra_final_from_film_density_lut_pixel(filmDensity[index], params, spectralInfo, colorInfo, transferKinds, paperCurveInfo,
++    paperLogExposure, paperDensityCurves, filmSpectralDensity, filteredEnlargerResponse, paperSpectralDensity,
++    scanProducts, scanToOutputRgbData, encodeLuts, frameConstants, encodeOutput, enlargerLut, scannerLut);
++  spektra_adobe_host_store(destination, destinationLayout, gid,
++    float4(pixel.rgb, spektra_adobe_host_load(hostSource, sourceLayout, gid).a));
++}
++
+ kernel void spektrafilm_print_raw_from_film_density(
+   device const float4 *filmDensity [[buffer(0)]],
+   device float4 *printRawOut [[buffer(1)]],
+@@ -6959,10 +7612,9 @@ static float3 spektra_process_negative_hanatos_raw(
+   constant SpektraSpectralInfo &spectralInfo,
+   device const float4 *paperHanatosResponse
+ ) {
+-  const uint compressedOffset = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression)
+-    ? spectralInfo.hanatosWidth * spectralInfo.hanatosHeight
+-    : 0u;
+-  return max(spektra_hanatos_raw(referenceXyz, spectralInfo, paperHanatosResponse + compressedOffset), float3(0.0));
++  const bool inputCompression = spektra_color_adaptation_enabled(params, kSpektraColorAdaptationInputCompression);
++  const uint compressedOffset = inputCompression ? spectralInfo.hanatosWidth * spectralInfo.hanatosHeight : 0u;
++  return max(spektra_hanatos_raw(referenceXyz, spectralInfo, paperHanatosResponse + compressedOffset, !inputCompression), float3(0.0));
+ }
+ 
+ kernel void spektrafilm_print_raw_from_negative_light(
+diff --git a/shaders/vulkan/SpektraFilmExposure.comp b/shaders/vulkan/SpektraFilmExposure.comp
+index fafedfa..9a84271 100644
+--- a/shaders/vulkan/SpektraFilmExposure.comp
++++ b/shaders/vulkan/SpektraFilmExposure.comp
+@@ -184,7 +184,10 @@ vec3 hanatosRaw(vec3 xyz) {
+   }
+ 
+   const float b = xyz.x + xyz.y + xyz.z;
+-  const vec2 xy = clamp(xyz.xy / max(b, 1.0e-10), vec2(0.0), vec2(1.0));
++  // spektrafilm clamps xy only without input gamut compression (eac6b85);
++  // the tc clamps below keep the lookup in bounds either way.
++  const vec2 xyRaw = xyz.xy / max(b, 1.0e-10);
++  const vec2 xy = colorAdaptationEnabled(kColorAdaptationInputCompression) ? xyRaw : clamp(xyRaw, vec2(0.0), vec2(1.0));
+   const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+   const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+   const float xCoord = tx * float(params.hanatosWidth - 1u);
+diff --git a/shaders/vulkan/SpektraPrintScan.comp b/shaders/vulkan/SpektraPrintScan.comp
+index 1ba6e14..ae1938d 100644
+--- a/shaders/vulkan/SpektraPrintScan.comp
++++ b/shaders/vulkan/SpektraPrintScan.comp
+@@ -864,7 +864,10 @@ vec3 hanatosRaw(vec3 xyz) {
+     return vec3(0.0);
+   }
+   const float b = xyz.x + xyz.y + xyz.z;
+-  const vec2 xy = clamp(xyz.xy / max(b, 1.0e-10), vec2(0.0), vec2(1.0));
++  // spektrafilm clamps xy only without input gamut compression (eac6b85);
++  // the tc clamps below keep the lookup in bounds either way.
++  const vec2 xyRaw = xyz.xy / max(b, 1.0e-10);
++  const vec2 xy = colorAdaptationEnabled(kColorAdaptationInputCompression) ? xyRaw : clamp(xyRaw, vec2(0.0), vec2(1.0));
+   const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+   const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+   const float xCoord = tx * float(params.hanatosWidth - 1u);
+@@ -901,7 +904,10 @@ vec3 processNegativeHanatosRaw(vec3 xyz, bool preflash) {
+     return vec3(0.0);
+   }
+   const float b = xyz.x + xyz.y + xyz.z;
+-  const vec2 xy = clamp(xyz.xy / max(b, 1.0e-10), vec2(0.0), vec2(1.0));
++  // spektrafilm clamps xy only without input gamut compression (eac6b85);
++  // the tc clamps below keep the lookup in bounds either way.
++  const vec2 xyRaw = xyz.xy / max(b, 1.0e-10);
++  const vec2 xy = colorAdaptationEnabled(kColorAdaptationInputCompression) ? xyRaw : clamp(xyRaw, vec2(0.0), vec2(1.0));
+   const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+   const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+   const float xCoord = tx * float(params.hanatosWidth - 1u);
+diff --git a/src/SpektraMetalRenderer.h b/src/SpektraMetalRenderer.h
+index a19623d..492365a 100644
+--- a/src/SpektraMetalRenderer.h
++++ b/src/SpektraMetalRenderer.h
+@@ -21,6 +21,26 @@ struct MetalBufferImageView {
+   int32_t bytesPerComponent = 0;
+ };
+ 
++// Adobe port: host frame layout (float32/float16, RGBA/BGRA/ARGB, straight or
++// premultiplied, row padding, start offset). Matches SpektraAdobeHostLayout in
++// SpektraFilm.metal.
++struct AdobeHostLayout {
++  uint64_t rowComponents = 0;
++  uint64_t offsetComponents = 0;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  uint32_t order = 0;
++  uint32_t premultiplied = 0;
++  uint32_t halfPrecision = 0;
++  uint32_t reserved = 0;
++};
++static_assert(sizeof(AdobeHostLayout) == 40, "Must match SpektraAdobeHostLayout");
++
++struct AdobeHostFrames {
++  AdobeHostLayout source;
++  AdobeHostLayout destination;
++};
++
+ class MetalRenderer final : public Renderer {
+ public:
+   MetalRenderer();
+@@ -50,9 +70,19 @@ public:
+     const RenderWindow &window,
+     const RenderParams &params,
+     double time,
+-    void *commandQueue
++    void *commandQueue,
++    // Adobe port: when set, the source and destination buffers hold host frames in
++    // these layouts (the views then only give the window size) and the destination
++    // keeps the source alpha. Default paths read and write them in the first and last
++    // passes; other paths convert through float staging buffers.
++    const AdobeHostFrames *adobeHost = nullptr
+   );
+ 
++  // id<MTLCommandBuffer> that the last renderMetalBuffers call committed to the
++  // caller's queue, or null. Completion of it, or of later work on that queue,
++  // makes the renderer's buffers safe to reuse.
++  void *lastSubmittedCommandBuffer() const;
++
+ private:
+   struct Impl;
+   std::unique_ptr<Impl> impl_;
+diff --git a/src/SpektraMetalRenderer.mm b/src/SpektraMetalRenderer.mm
+index 0a81297..6cd8f4a 100644
+--- a/src/SpektraMetalRenderer.mm
++++ b/src/SpektraMetalRenderer.mm
+@@ -1,5 +1,8 @@
+ #include "SpektraMetalRenderer.h"
+ #include "SpektraProfileCurves.h"
++#ifdef SPEKTRAFILM_ADOBE_PORT
++#include "SpektraFilmSource.h"
++#endif
+ 
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+@@ -32,6 +35,7 @@ namespace {
+ int bundleImageAnchor = 0;
+ 
+ NSURL *findBundleResourceURL(NSString *name, NSString *extension) {
++#ifndef SPEKTRAFILM_ADOBE_PORT
+   NSArray<NSString *> *bundleIdentifiers = @[
+     @"org.spektrafilm",
+     @"org.spektrafilm.flow",
+@@ -56,6 +60,7 @@ NSURL *findBundleResourceURL(NSString *name, NSString *extension) {
+   if (fallback) {
+     return [NSURL fileURLWithPath:fallback];
+   }
++#endif
+ 
+   NSMutableArray<NSString *> *fallbackDirectories = [NSMutableArray array];
+   NSString *resourceDir = [[[NSProcessInfo processInfo] environment] objectForKey:@"SPEKTRAFILM_RESOURCE_DIR"];
+@@ -297,7 +302,7 @@ struct KernelParams {
+   float scannerUnsharpAmount;
+   uint32_t densityCurveLookupMode;
+   uint32_t spectralTransmittanceMode;
+-  uint32_t _padPerf0;
++  uint32_t grainPreciseMath;
+   float time;
+ };
+ 
+@@ -2528,6 +2533,9 @@ struct ExternalMetalBufferContext {
+   bool sourceStridedHalf = false;
+   bool destinationStridedFloat = false;
+   bool destinationStridedHalf = false;
++  bool adobeHost = false;
++  AdobeHostLayout adobeSourceLayout{};
++  AdobeHostLayout adobeDestinationLayout{};
+ };
+ 
+ thread_local ExternalMetalBufferContext *gExternalMetalBufferContext = nullptr;
+@@ -2599,6 +2607,9 @@ struct MetalRenderer::Impl {
+   id<MTLComputePipelineState> enlargerResamplePipeline = nil;
+   id<MTLComputePipelineState> grainPipeline = nil;
+   id<MTLComputePipelineState> halationRawExposurePipeline = nil;
++  id<MTLComputePipelineState> halationRawExposureAdobeHostPipeline = nil;
++  id<MTLComputePipelineState> adobeHostUnpackPipeline = nil;
++  id<MTLComputePipelineState> adobeHostPackPipeline = nil;
+   id<MTLComputePipelineState> halationBoostMaxPipeline = nil;
+   id<MTLComputePipelineState> halationBoostReduceMaxPipeline = nil;
+   id<MTLComputePipelineState> halationBoostApplyPipeline = nil;
+@@ -2609,6 +2620,7 @@ struct MetalRenderer::Impl {
+   id<MTLComputePipelineState> halationScatterTailGroupBlurXPipeline = nil;
+   id<MTLComputePipelineState> halationScatterTailGroupBlurYPipeline = nil;
+   id<MTLComputePipelineState> halationScatterResolvePipeline = nil;
++  id<MTLComputePipelineState> halationScatterTailGroupBlurYResolvePipeline = nil;
+   id<MTLComputePipelineState> halationClearPipeline = nil;
+   id<MTLComputePipelineState> halationBounceBlurXPipeline = nil;
+   id<MTLComputePipelineState> halationBounceBlurYAccumulatePipeline = nil;
+@@ -2617,7 +2629,6 @@ struct MetalRenderer::Impl {
+   id<MTLComputePipelineState> rawToLogRawPipeline = nil;
+   id<MTLComputePipelineState> developFromRawPipeline = nil;
+   id<MTLComputePipelineState> diffusionComponentBlurXPipeline = nil;
+-  id<MTLComputePipelineState> diffusionComponentBlurYAccumulatePipeline = nil;
+   id<MTLComputePipelineState> diffusionGroupBlurXPipeline = nil;
+   id<MTLComputePipelineState> diffusionGroupBlurYAccumulatePipeline = nil;
+   id<MTLComputePipelineState> diffusionDownsamplePipeline = nil;
+@@ -2685,6 +2696,31 @@ struct MetalRenderer::Impl {
+   id<MTLComputePipelineState> filteredEnlargerResponsePipeline = nil;
+   id<MTLComputePipelineState> frameConstantsPipeline = nil;
+   id<MTLComputePipelineState> finalFromFilmDensityPipeline = nil;
++  id<MTLComputePipelineState> buildSpectralLutsPipeline = nil;
++  id<MTLComputePipelineState> measureSpectralLutsPipeline = nil;
++  std::array<float, 2> spectralLutTolerance{};
++  id<MTLComputePipelineState> finalFromFilmDensityLutPipeline = nil;
++  id<MTLComputePipelineState> finalFromFilmDensityLutAdobeHostPipeline = nil;
++  uint32_t spectralLutSize = 0u;
++  id<MTLCommandBuffer> lastSubmittedCommandBuffer = nil;
++  // The frame constants and spectral LUTs depend only on the kernel parameters
++  // (except time, which only seeds grain) and on the static profile resources.
++  // Playback with unchanged controls reuses them instead of recomputing.
++  using ParameterKey = std::array<unsigned char, sizeof(KernelParams)>;
++  struct ParameterCache {
++    ParameterKey key{};
++    uint64_t version = 0u;
++    bool valid = false;
++    bool matches(const ParameterKey &other, uint64_t otherVersion) const {
++      return valid && version == otherVersion && key == other;
++    }
++  };
++  uint64_t staticResourcesVersion = 0u;
++  id<MTLBuffer> frameConstantsCache = nil;
++  ParameterCache frameConstantsState;
++  id<MTLBuffer> enlargerLutCache = nil;
++  id<MTLBuffer> scannerLutCache = nil;
++  ParameterCache spectralLutState;
+   id<MTLComputePipelineState> printRawFromFilmDensityPipeline = nil;
+   id<MTLComputePipelineState> printRawFromNegativeLightPipeline = nil;
+   id<MTLComputePipelineState> printDensityFromPrintRawPipeline = nil;
+@@ -2724,6 +2760,7 @@ struct MetalRenderer::Impl {
+   bool useScannerTextures = false;
+   bool scannerMps = false;
+   bool halationGroupedTail = false;
++  bool preciseMath = false;
+   bool grainBlurRecurrence = true;
+   bool useLegacyGrainSynthesis = false;
+   bool linearFinalOutput = false;
+@@ -2734,7 +2771,7 @@ struct MetalRenderer::Impl {
+   DensityCurveLookupMode densityCurveLookupMode = DensityCurveLookupMode::Binary;
+   SpectralTransmittanceMode spectralTransmittanceMode = SpectralTransmittanceMode::Pow;
+   uint32_t grainSynthesisRadiusLutSize = 512u;
+-  uint32_t diffusionGroupSize = 2;
++  uint32_t diffusionGroupSize = 4;
+   float diffusionClusterSigmaRatio = 0.10f;
+   std::string passTimingMode = "off";
+   std::string blurBackend = "custom";
+@@ -3061,6 +3098,7 @@ struct MetalRenderer::Impl {
+     }
+ 
+     staticResources.reset();
++    ++staticResourcesVersion;
+     const ProfileCurveSet *filmCurves = selectedFilmCurves(params);
+     const ProfileCurveSet *paperCurves = selectedPaperCurves(params);
+     if (!filmCurves || filmCurves->exposureCount == 0 || !filmCurves->logExposure || !filmCurves->densityCurves) {
+@@ -3334,6 +3372,7 @@ struct MetalRenderer::Impl {
+       return false;
+     }
+     staticResources = next;
++    ++staticResourcesVersion;
+     lastError.clear();
+     return true;
+   }
+@@ -3408,7 +3447,12 @@ struct MetalRenderer::Impl {
+         diffusionClusterSigma = "off";
+         diffusionClusterSigmaRatio = 0.0f;
+       }
+-      halationGroupedTail = envFlagEnabled("SPEKTRAFILM_HALATION_GROUPED_TAIL");
++      // The grouped tail is bit-identical to the per-component tail and faster on
++      // Apple GPUs; SPEKTRAFILM_HALATION_GROUPED_TAIL=0 restores the per-component passes.
++      halationGroupedTail = envFlagEnabledOrDefault("SPEKTRAFILM_HALATION_GROUPED_TAIL", true);
++      // Fast single-precision math functions (output differences of about 1e-6);
++      // SPEKTRAFILM_PRECISE_MATH=1 restores precise functions and the exact output.
++      preciseMath = envFlagEnabled("SPEKTRAFILM_PRECISE_MATH");
+       scannerMps = envFlagEnabled("SPEKTRAFILM_SCANNER_MPS");
+       grainBlurRecurrence = envFlagEnabledOrDefault("SPEKTRAFILM_GRAIN_BLUR_RECURRENCE", true);
+       dirTailBackend = envString("SPEKTRAFILM_DIR_TAIL_BACKEND", "mps") == "mps"
+@@ -3435,11 +3479,23 @@ struct MetalRenderer::Impl {
+         spectralTransmittance = "pow";
+         spectralTransmittanceMode = SpectralTransmittanceMode::Pow;
+       }
++      // Spectral 3D LUT grid size; "off" evaluates every pixel exactly.
++      const std::string spectralLutText = envString("SPEKTRAFILM_SPECTRAL_LUT", "49");
++      spectralLutSize = spectralLutText == "off" ? 0u : static_cast<uint32_t>(std::clamp(std::atoi(spectralLutText.c_str()), 0, 129));
++      if (spectralLutSize < 5u) {
++        spectralLutSize = 0u;
++      }
++      // Largest accepted output error per LUT cell, in output code values
++      // (encoded when the kernel encodes). Other cells are evaluated exactly.
++      spectralLutTolerance = {
++        static_cast<float>(std::atof(envString("SPEKTRAFILM_SPECTRAL_LUT_ENLARGER_TOLERANCE", "5e-4").c_str())),
++        static_cast<float>(std::atof(envString("SPEKTRAFILM_SPECTRAL_LUT_SCANNER_TOLERANCE", "5e-4").c_str()))
++      };
+       finalCoreMode = envString("SPEKTRAFILM_FINAL_CORE_MODE", "fused");
+       if (finalCoreMode != "fused" && finalCoreMode != "staged") {
+         finalCoreMode = "fused";
+       }
+-      const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "2");
++      const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "4");
+       if (diffusionGroupSizeText == "1") {
+         diffusionGroupSize = 1u;
+       } else if (diffusionGroupSizeText == "2") {
+@@ -3475,14 +3531,34 @@ struct MetalRenderer::Impl {
+         return;
+       }
+ 
++      NSError *error = nil;
++#ifdef SPEKTRAFILM_ADOBE_PORT
++      MTLCompileOptions *options = [MTLCompileOptions new];
++      if (@available(macOS 15.0, *)) {
++        // Safe arithmetic keeps IEEE semantics (no reassociation, infs and NaNs
++        // preserved); only the math functions use the metal::fast variants. Values
++        // quantized into grain cells use precise:: explicitly in the shader.
++        options.mathMode = MTLMathModeSafe;
++        options.mathFloatingPointFunctions = preciseMath
++          ? MTLMathFloatingPointFunctionsPrecise
++          : MTLMathFloatingPointFunctionsFast;
++      } else {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++        options.fastMathEnabled = NO;
++#pragma clang diagnostic pop
++      }
++      options.languageVersion = MTLLanguageVersion2_3;
++      id<MTLLibrary> library = [device newLibraryWithSource:@(kSpektraFilmSource) options:options error:&error];
++#else
+       NSURL *libraryURL = findBundleResourceURL(@"SpektraFilm", @"metallib");
+       if (!libraryURL) {
+         lastError = "Unable to locate SpektraFilm.metallib in bundle resources.";
+         return;
+       }
+ 
+-      NSError *error = nil;
+       id<MTLLibrary> library = [device newLibraryWithURL:libraryURL error:&error];
++#endif
+       if (!library) {
+         lastError = error ? [[error localizedDescription] UTF8String] : "Unable to load Metal library.";
+         return;
+@@ -3506,6 +3582,9 @@ struct MetalRenderer::Impl {
+       enlargerResamplePipeline = makePipeline(@"spektrafilm_enlarger_resample");
+       grainPipeline = makePipeline(@"spektrafilm_grain_preview");
+       halationRawExposurePipeline = makePipeline(@"spektrafilm_halation_raw_exposure");
++      halationRawExposureAdobeHostPipeline = makePipeline(@"spektrafilm_halation_raw_exposure_adobe_host");
++      adobeHostUnpackPipeline = makePipeline(@"spektrafilm_adobe_host_unpack");
++      adobeHostPackPipeline = makePipeline(@"spektrafilm_adobe_host_pack");
+       halationBoostMaxPipeline = makePipeline(@"spektrafilm_halation_boost_max");
+       halationBoostReduceMaxPipeline = makePipeline(@"spektrafilm_halation_boost_reduce_max");
+       halationBoostApplyPipeline = makePipeline(@"spektrafilm_halation_boost_apply");
+@@ -3516,6 +3595,7 @@ struct MetalRenderer::Impl {
+       halationScatterTailGroupBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_group_blur_x");
+       halationScatterTailGroupBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_group_blur_y");
+       halationScatterResolvePipeline = makePipeline(@"spektrafilm_halation_scatter_resolve");
++      halationScatterTailGroupBlurYResolvePipeline = makePipeline(@"spektrafilm_halation_scatter_tail_group_blur_y_resolve");
+       halationClearPipeline = makePipeline(@"spektrafilm_halation_clear");
+       halationBounceBlurXPipeline = makePipeline(@"spektrafilm_halation_bounce_blur_x");
+       halationBounceBlurYAccumulatePipeline = makePipeline(@"spektrafilm_halation_bounce_blur_y_accumulate");
+@@ -3524,7 +3604,6 @@ struct MetalRenderer::Impl {
+       rawToLogRawPipeline = makePipeline(@"spektrafilm_raw_to_log_raw");
+       developFromRawPipeline = makePipeline(@"spektrafilm_develop_from_raw");
+       diffusionComponentBlurXPipeline = makePipeline(@"spektrafilm_diffusion_component_blur_x");
+-      diffusionComponentBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_component_blur_y_accumulate");
+       diffusionGroupBlurXPipeline = makePipeline(@"spektrafilm_diffusion_group_blur_x");
+       diffusionGroupBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_group_blur_y_accumulate");
+       diffusionDownsamplePipeline = makePipeline(@"spektrafilm_diffusion_downsample");
+@@ -3592,6 +3671,10 @@ struct MetalRenderer::Impl {
+       filteredEnlargerResponsePipeline = makePipeline(@"spektrafilm_filtered_enlarger_response");
+       frameConstantsPipeline = makePipeline(@"spektrafilm_frame_constants");
+       finalFromFilmDensityPipeline = makePipeline(@"spektrafilm_final_from_film_density");
++      buildSpectralLutsPipeline = makePipeline(@"spektrafilm_build_spectral_luts");
++      measureSpectralLutsPipeline = makePipeline(@"spektrafilm_measure_spectral_luts");
++      finalFromFilmDensityLutPipeline = makePipeline(@"spektrafilm_final_from_film_density_lut");
++      finalFromFilmDensityLutAdobeHostPipeline = makePipeline(@"spektrafilm_final_from_film_density_lut_adobe_host");
+       printRawFromFilmDensityPipeline = makePipeline(@"spektrafilm_print_raw_from_film_density");
+       printRawFromNegativeLightPipeline = makePipeline(@"spektrafilm_print_raw_from_negative_light");
+       printDensityFromPrintRawPipeline = makePipeline(@"spektrafilm_print_density_from_print_raw");
+@@ -3615,14 +3698,16 @@ struct MetalRenderer::Impl {
+       scannerFinalizePipeline = makePipeline(@"spektrafilm_scanner_finalize");
+       scannerFinalizeTexturePipeline = makePipeline(@"spektrafilm_scanner_finalize_texture");
+       if (!enlargerResamplePipeline ||
+-          !grainPipeline || !halationRawExposurePipeline || !halationBoostMaxPipeline ||
++          !grainPipeline || !halationRawExposurePipeline || !halationRawExposureAdobeHostPipeline ||
++          !adobeHostUnpackPipeline || !adobeHostPackPipeline || !finalFromFilmDensityLutAdobeHostPipeline ||
++          !halationBoostMaxPipeline ||
+           !halationBoostReduceMaxPipeline || !halationBoostApplyPipeline || !halationScatterCoreBlurXPipeline ||
+           !halationScatterCoreBlurYPipeline || !halationScatterTailBlurXPipeline || !halationScatterTailBlurYPipeline ||
+           !halationScatterTailGroupBlurXPipeline || !halationScatterTailGroupBlurYPipeline ||
+-          !halationScatterResolvePipeline || !halationClearPipeline || !halationBounceBlurXPipeline ||
++          !halationScatterResolvePipeline || !halationScatterTailGroupBlurYResolvePipeline || !halationClearPipeline || !halationBounceBlurXPipeline ||
+           !halationBounceBlurYAccumulatePipeline || !halationResolveLogRawPipeline || !halationResolveDensityPipeline ||
+           !rawToLogRawPipeline || !developFromRawPipeline ||
+-          !diffusionComponentBlurXPipeline || !diffusionComponentBlurYAccumulatePipeline ||
++          !diffusionComponentBlurXPipeline ||
+           !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline ||
+           !diffusionDownsamplePipeline || !diffusionDownsampleBlurXPipeline || !diffusionDownsampleBlurYPipeline ||
+           !diffusionDownsampleUpsampleAccumulatePipeline || !diffusionDownsampleGroupBlurXPipeline ||
+@@ -3660,6 +3745,7 @@ struct MetalRenderer::Impl {
+           !grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline ||
+           !grainSynthesisResolveDensityPipeline ||
+           !filteredEnlargerResponsePipeline || !frameConstantsPipeline || !finalFromFilmDensityPipeline ||
++          !buildSpectralLutsPipeline || !measureSpectralLutsPipeline || !finalFromFilmDensityLutPipeline ||
+           !printRawFromFilmDensityPipeline || !printRawFromNegativeLightPipeline || !printDensityFromPrintRawPipeline ||
+           !profilePrintScanFromDensityPipeline || !profileFinalizeOutputPipeline || !finalFromPrintRawPipeline ||
+           !printGlareGeneratePipeline || !printGlareBlurXPipeline || !printGlareBlurYPipeline ||
+@@ -3716,15 +3802,17 @@ MetalRenderer::~MetalRenderer() = default;
+ 
+ bool MetalRenderer::isAvailable() const {
+   return impl_ && impl_->device && impl_->commandQueue && impl_->enlargerResamplePipeline && impl_->grainPipeline &&
+-    impl_->halationRawExposurePipeline && impl_->halationScatterCoreBlurXPipeline &&
++    impl_->halationRawExposurePipeline && impl_->halationRawExposureAdobeHostPipeline &&
++    impl_->adobeHostUnpackPipeline && impl_->adobeHostPackPipeline &&
++    impl_->finalFromFilmDensityLutAdobeHostPipeline && impl_->halationScatterCoreBlurXPipeline &&
+     impl_->halationScatterCoreBlurYPipeline && impl_->halationScatterTailBlurXPipeline &&
+     impl_->halationScatterTailBlurYPipeline && impl_->halationScatterTailGroupBlurXPipeline &&
+     impl_->halationScatterTailGroupBlurYPipeline && impl_->halationScatterResolvePipeline &&
++    impl_->halationScatterTailGroupBlurYResolvePipeline &&
+     impl_->halationClearPipeline && impl_->halationBounceBlurXPipeline &&
+     impl_->halationBounceBlurYAccumulatePipeline && impl_->halationResolveLogRawPipeline &&
+     impl_->halationResolveDensityPipeline && impl_->rawToLogRawPipeline && impl_->developFromRawPipeline &&
+     impl_->diffusionComponentBlurXPipeline &&
+-    impl_->diffusionComponentBlurYAccumulatePipeline &&
+     impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline &&
+     impl_->diffusionDownsamplePipeline && impl_->diffusionDownsampleBlurXPipeline &&
+     impl_->diffusionDownsampleBlurYPipeline && impl_->diffusionDownsampleUpsampleAccumulatePipeline &&
+@@ -4036,6 +4124,33 @@ bool MetalRenderer::render(
+       : std::vector<KernelDiffusionComponent>{};
+     const bool cameraDiffusionPath = cameraDiffusionRequested && cameraDiffusionInfo.componentCount > 0u && !cameraDiffusionComponents.empty();
+     const bool printDiffusionPath = printDiffusionRequested && printDiffusionInfo.componentCount > 0u && !printDiffusionComponents.empty();
++    // Adobe port: the halation bounces are Gaussians of 1, 2 and 3 times the
++    // variance of the first, weighted 1, 1/2, 1/4 over 1.75. On small formats
++    // they span tens of pixels; those wider than the diffusion downsample
++    // threshold are blurred at reduced resolution, like the diffusion
++    // components. SPEKTRAFILM_BLUR_DOWNSAMPLE=off keeps all of them exact.
++    std::array<KernelDiffusionComponent, 3> halationBounceComponents{};
++    std::array<uint32_t, 3> halationBounceScale{1u, 1u, 1u};
++    bool halationDownsamplePath = false;
++    {
++      const float sigmaUm[3] = {
++        filmCurves && filmCurves->halationFirstSigmaUm ? filmCurves->halationFirstSigmaUm[0] : params.halationFirstSigmaUmR,
++        filmCurves && filmCurves->halationFirstSigmaUm ? filmCurves->halationFirstSigmaUm[1] : params.halationFirstSigmaUmG,
++        filmCurves && filmCurves->halationFirstSigmaUm ? filmCurves->halationFirstSigmaUm[2] : params.halationFirstSigmaUmB,
++      };
++      // The downsampled kernels blur all channels with one sigma.
++      if (halationBouncePath && impl_->blurDownsample != "off" &&
++          sigmaUm[0] == sigmaUm[1] && sigmaUm[1] == sigmaUm[2]) {
++        for (uint32_t bounce = 0; bounce < 3u; ++bounce) {
++          const float sigmaPx = std::max(sigmaUm[0], 1.0e-6f) * std::max(params.halationScale, 0.0f) *
++            std::sqrt(static_cast<float>(bounce + 1u)) / std::max(pixelSizeUm, 1.0e-6f);
++          const float weight = std::pow(0.5f, static_cast<float>(bounce)) / 1.75f;
++          halationBounceComponents[bounce] = {sigmaPx, weight, weight, weight};
++          halationBounceScale[bounce] = diffusionDownsampleScaleForSigma(impl_->blurDownsample, sigmaPx);
++          halationDownsamplePath = halationDownsamplePath || halationBounceScale[bounce] > 1u;
++        }
++      }
++    }
+     const bool sourceTransformPath = !finalProcessNegative && enlargerTransformActive(params);
+     const bool preExposurePath =
+       halationBoostPath || cameraDiffusionPath || halationPath || (printDiffusionPath && !finalProcessNegative) || finalPrintSimulation || finalScanNegative ||
+@@ -4193,7 +4308,8 @@ bool MetalRenderer::render(
+     const bool diffusionDownsamplePath = impl_->blurDownsample != "off" &&
+       (anyDiffusionComponentDownsamples(cameraDiffusionComponents, impl_->blurDownsample) ||
+        anyDiffusionComponentDownsamples(printDiffusionComponents, impl_->blurDownsample));
+-    const bool diffusionDownsampleHalfPath = diffusionDownsamplePath && impl_->intermediatePrecision == "half-blur";
++    const bool blurDownsampleBuffersPath = diffusionDownsamplePath || halationDownsamplePath;
++    const bool diffusionDownsampleHalfPath = blurDownsampleBuffersPath && impl_->intermediatePrecision == "half-blur";
+     const NSUInteger diffusionDownsampleBufferBytes = static_cast<NSUInteger>((width + 1) / 2) *
+       static_cast<NSUInteger>((height + 1) / 2) * pixelBytes;
+     const NSUInteger diffusionDownsampleIntermediatePlaneBytes = diffusionDownsampleHalfPath
+@@ -4206,10 +4322,46 @@ bool MetalRenderer::render(
+       ? static_cast<uint32_t>((static_cast<uint64_t>(width) * static_cast<uint64_t>(height) +
+           kHalationBoostMaxChunkPixels - 1u) / kHalationBoostMaxChunkPixels)
+       : 0u;
+-    id<MTLBuffer> frameConstantsBuffer = needsFrameConstants ? impl_->gpuScratchBuffer(sizeof(float) * 24u, "frame constants") : nil;
++    if (needsFrameConstants && !impl_->frameConstantsCache) {
++      impl_->frameConstantsCache = [impl_->device newBufferWithLength:sizeof(float) * 24u options:MTLResourceStorageModePrivate];
++      impl_->frameConstantsState.valid = false;
++    }
++    id<MTLBuffer> frameConstantsBuffer = needsFrameConstants ? impl_->frameConstantsCache : nil;
+     id<MTLBuffer> filteredEnlargerResponseBuffer = printSimulationPath
+       ? impl_->gpuScratchBuffer(filteredEnlargerResponseBytes, "filtered enlarger response")
+       : nil;
++    // The LUT replaces only the two spectral integrals of the plain print path.
++    const uint32_t spectralLutSize = impl_->spectralLutSize;
++    const bool spectralLutPath = spectralLutSize > 0u && filteredEnlargerResponseBuffer && resources.paperCurves &&
++      static_cast<int32_t>(params.process) == 0 && static_cast<int32_t>(params.printTiming) != 1 &&
++      params.negativeBleachBypassAmount == 0.0f && params.printBleachBypassAmount == 0.0f;
++    const NSUInteger spectralLutBytes = (2u + static_cast<NSUInteger>(spectralLutSize) * spectralLutSize * spectralLutSize) * sizeof(float) * 4u;
++    if (spectralLutPath && (!impl_->enlargerLutCache || !impl_->scannerLutCache ||
++        [impl_->enlargerLutCache length] < spectralLutBytes || [impl_->scannerLutCache length] < spectralLutBytes)) {
++      impl_->enlargerLutCache = [impl_->device newBufferWithLength:spectralLutBytes options:MTLResourceStorageModePrivate];
++      impl_->scannerLutCache = [impl_->device newBufferWithLength:spectralLutBytes options:MTLResourceStorageModePrivate];
++      impl_->spectralLutState.valid = false;
++    }
++    id<MTLBuffer> enlargerLutBuffer = spectralLutPath ? impl_->enlargerLutCache : nil;
++    id<MTLBuffer> scannerLutBuffer = spectralLutPath ? impl_->scannerLutCache : nil;
++    // filmMin, filmMax, printMin, printMax as float4; see SpektraLutDomain.
++    std::array<float, 16> spectralLutDomain{};
++    if (spectralLutPath) {
++      auto curveMaximum = [](const ProfileCurveSet &curves, uint32_t channel) {
++        float maximum = 0.0f;
++        for (uint32_t i = 0u; i < curves.exposureCount; ++i) {
++          maximum = std::fmax(maximum, curves.densityCurves[i * 3u + channel]);
++        }
++        return std::max(maximum, 1.0e-6f);
++      };
++      const float grainMin[3] = {params.grainDensityMinR, params.grainDensityMinG, params.grainDensityMinB};
++      for (uint32_t c = 0u; c < 3u; ++c) {
++        spectralLutDomain[c] = std::min(-grainMin[c], 0.0f);
++        spectralLutDomain[4u + c] = curveMaximum(*filmCurves, c);
++        spectralLutDomain[8u + c] = 0.0f;
++        spectralLutDomain[12u + c] = curveMaximum(*resources.paperCurves, c);
++      }
++    }
+     id<MTLBuffer> scannerRgbBufferA = ((finalPostProcessPath && !directFinalEncodePath) || stagedFinalCorePath)
+       ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A")
+       : nil;
+@@ -4241,15 +4393,18 @@ bool MetalRenderer::render(
+     id<MTLBuffer> printDiffusionComponentsBuffer = printDiffusionPath && !printDiffusionComponents.empty()
+       ? impl_->sharedScratchBuffer(printDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "print diffusion components")
+       : nil;
+-    id<MTLBuffer> diffusionDownsampleSourceBuffer = diffusionDownsamplePath
++    id<MTLBuffer> diffusionDownsampleSourceBuffer = blurDownsampleBuffersPath
+       ? impl_->gpuScratchBuffer(diffusionDownsampleBufferBytes, "diffusion downsample source")
+       : nil;
+-    id<MTLBuffer> diffusionDownsampleTempBuffer = diffusionDownsamplePath
++    id<MTLBuffer> diffusionDownsampleTempBuffer = blurDownsampleBuffersPath
+       ? impl_->gpuScratchBuffer(diffusionDownsampleGroupBytes, "diffusion downsample temp")
+       : nil;
+-    id<MTLBuffer> diffusionDownsampleBlurBuffer = diffusionDownsamplePath
++    id<MTLBuffer> diffusionDownsampleBlurBuffer = blurDownsampleBuffersPath
+       ? impl_->gpuScratchBuffer(diffusionDownsampleGroupBytes, "diffusion downsample blur")
+       : nil;
++    id<MTLBuffer> halationBounceComponentsBuffer = halationDownsamplePath
++      ? impl_->sharedScratchBuffer(sizeof(halationBounceComponents), "halation bounce components")
++      : nil;
+     id<MTLBuffer> printRawBufferA = (printDiffusionPath || printStageOutput || stagedFinalCorePath || finalProcessNegative)
+       ? impl_->gpuScratchBuffer(bufferBytes, "print raw A")
+       : nil;
+@@ -4408,6 +4563,7 @@ bool MetalRenderer::render(
+     KernelParams kernelParams = toKernelParams(params, time, width, height);
+     kernelParams.densityCurveLookupMode = static_cast<uint32_t>(impl_->densityCurveLookupMode);
+     kernelParams.spectralTransmittanceMode = static_cast<uint32_t>(impl_->spectralTransmittanceMode);
++    kernelParams.grainPreciseMath = impl_->preciseMath ? 1u : 0u;
+     applyProfileHalationDefaults(kernelParams, params, *filmCurves);
+     const KernelGaussianBlurInfo dirCoreBlurInfo = makeGaussianBlurInfo(
+       std::max(kernelParams.dirCouplersDiffusionUm, 0.0f) / std::max(kernelParams.filmPixelSizeUm, 1.0e-6f),
+@@ -4458,6 +4614,10 @@ bool MetalRenderer::render(
+       std::memcpy([dirCorrectedDensityCurvesBuffer contents], dirCorrectedDensityCurves.data(), densityCurveBytes);
+       impl_->diagnostics.uploadBytes += sizeof(dirInfo) + densityCurveBytes;
+     }
++    if (halationDownsamplePath) {
++      std::memcpy([halationBounceComponentsBuffer contents], halationBounceComponents.data(), sizeof(halationBounceComponents));
++      impl_->diagnostics.uploadBytes += sizeof(halationBounceComponents);
++    }
+     if (cameraDiffusionPath) {
+       std::memcpy([cameraDiffusionInfoBuffer contents], &cameraDiffusionInfo, sizeof(cameraDiffusionInfo));
+       std::memcpy([cameraDiffusionComponentsBuffer contents], cameraDiffusionComponents.data(), cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent));
+@@ -4638,6 +4798,9 @@ bool MetalRenderer::render(
+       impl_->diagnostics.passCount += 1u;
+       finishSplitTimedPass(passIndex, splitPassStart);
+     };
++    // Row-blocked blur kernels compute kSpektraBlurBlockY (SpektraFilm.metal) rows per thread.
++    constexpr uint32_t kBlurBlockY = 4u;
++    const uint32_t blurBlocksY = (static_cast<uint32_t>(height) + kBlurBlockY - 1u) / kBlurBlockY;
+     auto dispatch2DSize = [&](id<MTLComputePipelineState> pipeline, uint32_t dispatchWidth, uint32_t dispatchHeight, uint64_t estimatedBytes = 0u) {
+       if (encodeFailed) {
+         return;
+@@ -4787,6 +4950,16 @@ bool MetalRenderer::render(
+       }
+     };
+ 
++    // Adobe host frames: the default pre-exposure path reads the host source in its
++    // raw-exposure pass, where the source has no other reader; the final LUT pass
++    // writes the host destination when it is the last writer. Otherwise the frames
++    // go through unpack/pack passes and the float staging buffers.
++    const bool adobeHostFrames = externalMetal && externalMetal->adobeHost;
++    const bool adobeHostSourceFused =
++      adobeHostFrames && preExposureBranchPath && !finalProcessNegative && !sourceTransformPath &&
++      !productionGrainPath && !grainSynthesisPath;
++    bool adobeHostDestinationWritten = false;
++
+     if (externalMetal && externalMetal->sourceStridedFloat) {
+       [encoder setComputePipelineState:impl_->stridedFloatToFloatBufferPipeline];
+       [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:0];
+@@ -4805,6 +4978,12 @@ bool MetalRenderer::render(
+         impl_->stridedHalfToFloatBufferPipeline,
+         static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(uint16_t) * 4u + sizeof(float) * 4u)
+       );
++    } else if (adobeHostFrames && !adobeHostSourceFused) {
++      [encoder setComputePipelineState:impl_->adobeHostUnpackPipeline];
++      [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:0];
++      [encoder setBuffer:srcBuffer offset:0 atIndex:1];
++      [encoder setBytes:&externalMetal->adobeSourceLayout length:sizeof(AdobeHostLayout) atIndex:2];
++      dispatch2D(impl_->adobeHostUnpackPipeline);
+     }
+ 
+     if (sourceHalfWrappedDirectly) {
+@@ -4846,7 +5025,22 @@ bool MetalRenderer::render(
+       );
+     }
+ 
+-    if (needsFrameConstants) {
++    Impl::ParameterKey parameterKey{};
++    {
++      KernelParams keyParams = kernelParams;
++      keyParams.time = 0.0f;
++      std::memcpy(parameterKey.data(), &keyParams, sizeof(keyParams));
++    }
++    // Any recompute invalidates a cache until this command buffer is committed.
++    const bool frameConstantsEncoded = needsFrameConstants &&
++      !impl_->frameConstantsState.matches(parameterKey, impl_->staticResourcesVersion);
++    const bool spectralLutEncoded = enlargerLutBuffer && scannerLutBuffer &&
++      !impl_->spectralLutState.matches(parameterKey, impl_->staticResourcesVersion);
++    if (spectralLutEncoded) {
++      impl_->spectralLutState.valid = false;
++    }
++    if (frameConstantsEncoded) {
++      impl_->frameConstantsState.valid = false;
+       [encoder setComputePipelineState:impl_->frameConstantsPipeline];
+       [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:0];
+       [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+@@ -5068,6 +5262,77 @@ bool MetalRenderer::render(
+     auto encodeFinalFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
+       const uint32_t encodeOutput =
+         !impl_->linearFinalOutput && (directFinalEncodePath || !finalPostProcessPath) ? 1u : 0u;
++      if (enlargerLutBuffer && scannerLutBuffer) {
++        const uint32_t n = spectralLutSize;
++        if (spectralLutEncoded) {
++        [encoder setComputePipelineState:impl_->buildSpectralLutsPipeline];
++        [encoder setBuffer:enlargerLutBuffer offset:0 atIndex:0];
++        [encoder setBuffer:scannerLutBuffer offset:0 atIndex:1];
++        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
++        [encoder setBytes:&n length:sizeof(n) atIndex:3];
++        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
++        [encoder setBytes:spectralLutDomain.data() length:sizeof(spectralLutDomain) atIndex:5];
++        [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:6];
++        [encoder setBuffer:filteredEnlargerResponseBuffer offset:0 atIndex:7];
++        [encoder setBuffer:paperSpectralDensityBuffer offset:0 atIndex:8];
++        [encoder setBuffer:scanProductsBuffer offset:0 atIndex:9];
++        [encoder setBytes:impl_->spectralLutTolerance.data() length:sizeof(impl_->spectralLutTolerance) atIndex:10];
++        dispatch2DSize(impl_->buildSpectralLutsPipeline, n * n, n, spectralLutBytes * 2u);
++        // Build bindings plus the output stage; the serial encoder orders the
++        // measurement after the build and after the frame constants.
++        [encoder setComputePipelineState:impl_->measureSpectralLutsPipeline];
++        [encoder setBuffer:colorInfoBuffer offset:0 atIndex:11];
++        [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:12];
++        [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:13];
++        [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:14];
++        [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:15];
++        [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:16];
++        [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:17];
++        [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:18];
++        [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:19];
++        dispatch2DSize(impl_->measureSpectralLutsPipeline, (n - 1u) * (n - 1u), n - 1u, spectralLutBytes * 2u);
++        }
++
++        // Writing the final output into an Adobe host frame replaces the pack pass.
++        const bool writesHostFrame = adobeHostFrames && (directFinalEncodePath || !finalPostProcessPath);
++        id<MTLComputePipelineState> finalLutPipeline = writesHostFrame
++          ? impl_->finalFromFilmDensityLutAdobeHostPipeline
++          : impl_->finalFromFilmDensityLutPipeline;
++        [encoder setComputePipelineState:finalLutPipeline];
++        [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
++        if (writesHostFrame) {
++          [encoder setBuffer:externalMetal->destinationBuffer offset:0 atIndex:1];
++          [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:20];
++          [encoder setBytes:&externalMetal->adobeSourceLayout length:sizeof(AdobeHostLayout) atIndex:21];
++          [encoder setBytes:&externalMetal->adobeDestinationLayout length:sizeof(AdobeHostLayout) atIndex:22];
++          adobeHostDestinationWritten = true;
++        } else {
++          [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
++        }
++        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
++        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
++        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:4];
++        [encoder setBuffer:colorInfoBuffer offset:0 atIndex:5];
++        [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:6];
++        [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:7];
++        [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:8];
++        [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:9];
++        [encoder setBuffer:filmSpectralDensityBuffer offset:0 atIndex:10];
++        [encoder setBuffer:filteredEnlargerResponseBuffer offset:0 atIndex:11];
++        [encoder setBuffer:paperSpectralDensityBuffer offset:0 atIndex:12];
++        [encoder setBuffer:scanProductsBuffer offset:0 atIndex:13];
++        [encoder setBuffer:scanToOutputRgbDataBuffer offset:0 atIndex:14];
++        [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:15];
++        [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:16];
++        [encoder setBytes:&encodeOutput length:sizeof(encodeOutput) atIndex:17];
++        [encoder setBuffer:enlargerLutBuffer offset:0 atIndex:18];
++        [encoder setBuffer:scannerLutBuffer offset:0 atIndex:19];
++        dispatch2D(finalLutPipeline);
++        if (finalPostProcessPath && !directFinalEncodePath) {
++          encodeScannerPostProcess(scannerRgbBufferA);
++        }
++        return;
++      }
+       [encoder setComputePipelineState:impl_->finalFromFilmDensityPipeline];
+       [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
+       [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
+@@ -5500,6 +5765,115 @@ bool MetalRenderer::render(
+       }
+     };
+ 
++    // Blurs Gaussian components at reduced resolution and adds them, weighted, to accumBuffer.
++    auto encodeDownsampleDiffusionRange = [&](id<MTLBuffer> sourceBuffer, id<MTLBuffer> accumBuffer,
++                                              id<MTLBuffer> componentsBuffer, uint32_t component,
++                                              uint32_t groupCount, uint32_t downsampleScale) {
++      const uint32_t reducedDims[2] = {
++        static_cast<uint32_t>((width + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
++        static_cast<uint32_t>((height + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
++      };
++      const uint64_t reducedBytes = static_cast<uint64_t>(reducedDims[0]) *
++        static_cast<uint64_t>(reducedDims[1]) * pixelBytes;
++      const uint64_t reducedIntermediateBytes = diffusionDownsampleHalfPath
++        ? static_cast<uint64_t>(reducedDims[0]) * static_cast<uint64_t>(reducedDims[1]) * 4u * sizeof(uint16_t)
++        : reducedBytes;
++      const float sigmaScale = 1.0f / static_cast<float>(downsampleScale);
++
++      [encoder setComputePipelineState:impl_->diffusionDownsamplePipeline];
++      [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
++      [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:1];
++      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
++      [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
++      [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:4];
++      dispatch2DSize(
++        impl_->diffusionDownsamplePipeline,
++        reducedDims[0],
++        reducedDims[1],
++        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * pixelBytes + reducedBytes
++      );
++
++      if (groupCount <= 1u) {
++        id<MTLComputePipelineState> blurXPipeline = diffusionDownsampleHalfPath
++          ? impl_->diffusionDownsampleBlurXHalfPipeline
++          : impl_->diffusionDownsampleBlurXPipeline;
++        id<MTLComputePipelineState> blurYPipeline = diffusionDownsampleHalfPath
++          ? impl_->diffusionDownsampleBlurYHalfPipeline
++          : impl_->diffusionDownsampleBlurYPipeline;
++        id<MTLComputePipelineState> upsamplePipeline = diffusionDownsampleHalfPath
++          ? impl_->diffusionDownsampleUpsampleAccumulateHalfPipeline
++          : impl_->diffusionDownsampleUpsampleAccumulatePipeline;
++
++        [encoder setComputePipelineState:blurXPipeline];
++        [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
++        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
++        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
++        [encoder setBytes:&component length:sizeof(component) atIndex:4];
++        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
++        dispatch2DSize(blurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes);
++
++        [encoder setComputePipelineState:blurYPipeline];
++        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
++        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
++        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
++        [encoder setBytes:&component length:sizeof(component) atIndex:4];
++        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
++        dispatch2DSize(blurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * 2u);
++
++        [encoder setComputePipelineState:upsamplePipeline];
++        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
++        [encoder setBuffer:accumBuffer offset:0 atIndex:1];
++        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
++        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
++        [encoder setBytes:&component length:sizeof(component) atIndex:5];
++        [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
++        dispatch2D(upsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes);
++        return;
++      }
++
++      const uint32_t componentRange[2] = {component, groupCount};
++      id<MTLComputePipelineState> groupBlurXPipeline = diffusionDownsampleHalfPath
++        ? impl_->diffusionDownsampleGroupBlurXHalfPipeline
++        : impl_->diffusionDownsampleGroupBlurXPipeline;
++      id<MTLComputePipelineState> groupBlurYPipeline = diffusionDownsampleHalfPath
++        ? impl_->diffusionDownsampleGroupBlurYHalfPipeline
++        : impl_->diffusionDownsampleGroupBlurYPipeline;
++      id<MTLComputePipelineState> groupUpsamplePipeline = diffusionDownsampleHalfPath
++        ? impl_->diffusionDownsampleGroupUpsampleAccumulateHalfPipeline
++        : impl_->diffusionDownsampleGroupUpsampleAccumulatePipeline;
++
++      [encoder setComputePipelineState:groupBlurXPipeline];
++      [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
++      [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
++      [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++      [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
++      [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
++      [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
++      dispatch2DSize(groupBlurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes * groupCount);
++
++      [encoder setComputePipelineState:groupBlurYPipeline];
++      [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
++      [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
++      [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++      [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
++      [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
++      [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
++      dispatch2DSize(groupBlurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * groupCount * 2u);
++
++      [encoder setComputePipelineState:groupUpsamplePipeline];
++      [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
++      [encoder setBuffer:accumBuffer offset:0 atIndex:1];
++      [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
++      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
++      [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
++      [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:5];
++      [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
++      dispatch2D(groupUpsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes * groupCount);
++    };
++
+     auto encodeDiffusion = [&](id<MTLBuffer> sourceBuffer, id<MTLBuffer> destinationBuffer,
+                                id<MTLBuffer> tempBuffer, id<MTLBuffer> accumBuffer,
+                                id<MTLBuffer> infoBuffer, id<MTLBuffer> componentsBuffer,
+@@ -5522,13 +5896,16 @@ bool MetalRenderer::render(
+           [encoder setBytes:&component length:sizeof(component) atIndex:4];
+           dispatch2D(impl_->diffusionComponentBlurXPipeline);
+ 
+-          [encoder setComputePipelineState:impl_->diffusionComponentBlurYAccumulatePipeline];
++          // The row-blocked group Y kernel with one slot is the single-component Y pass.
++          const uint32_t singleRange[2] = {component, 1u};
++          [encoder setComputePipelineState:impl_->diffusionGroupBlurYAccumulatePipeline];
+           [encoder setBuffer:tempBuffer offset:0 atIndex:0];
+           [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+           [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+-          dispatch2D(impl_->diffusionComponentBlurYAccumulatePipeline);
++          [encoder setBytes:singleRange length:sizeof(singleRange) atIndex:4];
++          dispatch2DSize(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint32_t>(width), blurBlocksY,
++            static_cast<uint64_t>(bufferBytes) * 2u);
+           return;
+         }
+ 
+@@ -5547,113 +5924,8 @@ bool MetalRenderer::render(
+         [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+         [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+-        dispatch2D(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+-      };
+-
+-      auto encodeDownsampleDiffusionRange = [&](uint32_t component, uint32_t groupCount, uint32_t downsampleScale) {
+-        const uint32_t reducedDims[2] = {
+-          static_cast<uint32_t>((width + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
+-          static_cast<uint32_t>((height + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
+-        };
+-        const uint64_t reducedBytes = static_cast<uint64_t>(reducedDims[0]) *
+-          static_cast<uint64_t>(reducedDims[1]) * pixelBytes;
+-        const uint64_t reducedIntermediateBytes = diffusionDownsampleHalfPath
+-          ? static_cast<uint64_t>(reducedDims[0]) * static_cast<uint64_t>(reducedDims[1]) * 4u * sizeof(uint16_t)
+-          : reducedBytes;
+-        const float sigmaScale = 1.0f / static_cast<float>(downsampleScale);
+-
+-        [encoder setComputePipelineState:impl_->diffusionDownsamplePipeline];
+-        [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:1];
+-        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+-        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+-        [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:4];
+-        dispatch2DSize(
+-          impl_->diffusionDownsamplePipeline,
+-          reducedDims[0],
+-          reducedDims[1],
+-          static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * pixelBytes + reducedBytes
+-        );
+-
+-        if (groupCount <= 1u) {
+-          id<MTLComputePipelineState> blurXPipeline = diffusionDownsampleHalfPath
+-            ? impl_->diffusionDownsampleBlurXHalfPipeline
+-            : impl_->diffusionDownsampleBlurXPipeline;
+-          id<MTLComputePipelineState> blurYPipeline = diffusionDownsampleHalfPath
+-            ? impl_->diffusionDownsampleBlurYHalfPipeline
+-            : impl_->diffusionDownsampleBlurYPipeline;
+-          id<MTLComputePipelineState> upsamplePipeline = diffusionDownsampleHalfPath
+-            ? impl_->diffusionDownsampleUpsampleAccumulateHalfPipeline
+-            : impl_->diffusionDownsampleUpsampleAccumulatePipeline;
+-
+-          [encoder setComputePipelineState:blurXPipeline];
+-          [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
+-          [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
+-          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+-          [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+-          dispatch2DSize(blurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes);
+-
+-          [encoder setComputePipelineState:blurYPipeline];
+-          [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
+-          [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
+-          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+-          [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+-          dispatch2DSize(blurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * 2u);
+-
+-          [encoder setComputePipelineState:upsamplePipeline];
+-          [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
+-          [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+-          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+-          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
+-          [encoder setBytes:&component length:sizeof(component) atIndex:5];
+-          [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
+-          dispatch2D(upsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes);
+-          return;
+-        }
+-
+-        const uint32_t componentRange[2] = {component, groupCount};
+-        id<MTLComputePipelineState> groupBlurXPipeline = diffusionDownsampleHalfPath
+-          ? impl_->diffusionDownsampleGroupBlurXHalfPipeline
+-          : impl_->diffusionDownsampleGroupBlurXPipeline;
+-        id<MTLComputePipelineState> groupBlurYPipeline = diffusionDownsampleHalfPath
+-          ? impl_->diffusionDownsampleGroupBlurYHalfPipeline
+-          : impl_->diffusionDownsampleGroupBlurYPipeline;
+-        id<MTLComputePipelineState> groupUpsamplePipeline = diffusionDownsampleHalfPath
+-          ? impl_->diffusionDownsampleGroupUpsampleAccumulateHalfPipeline
+-          : impl_->diffusionDownsampleGroupUpsampleAccumulatePipeline;
+-
+-        [encoder setComputePipelineState:groupBlurXPipeline];
+-        [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
+-        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+-        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+-        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+-        dispatch2DSize(groupBlurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes * groupCount);
+-
+-        [encoder setComputePipelineState:groupBlurYPipeline];
+-        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
+-        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+-        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+-        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+-        dispatch2DSize(groupBlurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * groupCount * 2u);
+-
+-        [encoder setComputePipelineState:groupUpsamplePipeline];
+-        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+-        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+-        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+-        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
+-        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:5];
+-        [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
+-        dispatch2D(groupUpsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes * groupCount);
++        dispatch2DSize(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint32_t>(width), blurBlocksY,
++          static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+       };
+ 
+       if (diffusionDownsamplePath && diffusionDownsampleSourceBuffer && diffusionDownsampleTempBuffer && diffusionDownsampleBlurBuffer) {
+@@ -5670,7 +5942,7 @@ bool MetalRenderer::render(
+             continue;
+           }
+ 
+-          encodeDownsampleDiffusionRange(component, groupCount, downsampleScale);
++          encodeDownsampleDiffusionRange(sourceBuffer, accumBuffer, componentsBuffer, component, groupCount, downsampleScale);
+           component += groupCount;
+         }
+       } else {
+@@ -5887,8 +6159,15 @@ bool MetalRenderer::render(
+         encodeFinalFromPrintRaw(printRawBufferA);
+       }
+     } else if (preExposureBranchPath) {
+-      [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
+-      [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
++      if (adobeHostSourceFused) {
++        // Reads the Adobe host frame directly, replacing the unpack pass.
++        [encoder setComputePipelineState:impl_->halationRawExposureAdobeHostPipeline];
++        [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:0];
++        [encoder setBytes:&externalMetal->adobeSourceLayout length:sizeof(AdobeHostLayout) atIndex:14];
++      } else {
++        [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
++        [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
++      }
+       [encoder setBuffer:halationRawBufferA offset:0 atIndex:1];
+       [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+@@ -5902,7 +6181,7 @@ bool MetalRenderer::render(
+       [encoder setBuffer:colorInfoBuffer offset:0 atIndex:11];
+       [encoder setBuffer:colorDecodeLutBuffer offset:0 atIndex:12];
+       [encoder setBuffer:colorTransferKindBuffer offset:0 atIndex:13];
+-      dispatch2D(impl_->halationRawExposurePipeline);
++      dispatch2D(adobeHostSourceFused ? impl_->halationRawExposureAdobeHostPipeline : impl_->halationRawExposurePipeline);
+ 
+       id<MTLBuffer> currentRawBuffer = halationRawBufferA;
+       if (halationBoostPath) {
+@@ -5967,12 +6246,6 @@ bool MetalRenderer::render(
+         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+         dispatch2D(impl_->halationScatterCoreBlurYPipeline);
+ 
+-        [encoder setComputePipelineState:impl_->halationClearPipeline];
+-        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
+-        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+-        dispatch2D(impl_->halationClearPipeline);
+-
+         if (impl_->halationGroupedTail && halationScatterTailGroupBuffer) {
+           [encoder setComputePipelineState:impl_->halationScatterTailGroupBlurXPipeline];
+           [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+@@ -5981,13 +6254,18 @@ bool MetalRenderer::render(
+           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+           dispatch2D(impl_->halationScatterTailGroupBlurXPipeline, static_cast<uint64_t>(bufferBytes) * 4u);
+ 
+-          [encoder setComputePipelineState:impl_->halationScatterTailGroupBlurYPipeline];
++          // Tail Y blur and resolve in one pass; no accumulator or resolve pass.
++          [encoder setComputePipelineState:impl_->halationScatterTailGroupBlurYResolvePipeline];
+           [encoder setBuffer:halationScatterTailGroupBuffer offset:0 atIndex:0];
+-          [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
+-          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+-          dispatch2D(impl_->halationScatterTailGroupBlurYPipeline, static_cast<uint64_t>(bufferBytes) * 4u);
++          [encoder setBuffer:currentRawBuffer offset:0 atIndex:1];
++          [encoder setBuffer:scatterCoreBuffer offset:0 atIndex:2];
++          [encoder setBuffer:scatterResolvedBuffer offset:0 atIndex:3];
++          [encoder setBuffer:paramBuffer offset:0 atIndex:4];
++          [encoder setBytes:dims length:sizeof(dims) atIndex:5];
++          dispatch2DSize(impl_->halationScatterTailGroupBlurYResolvePipeline, static_cast<uint32_t>(width), blurBlocksY,
++            static_cast<uint64_t>(bufferBytes) * 6u);
+         } else {
++          // The first tail write initializes scatterAccumBuffer; no clear pass is needed.
+           for (uint32_t component = 0; component < 3u; ++component) {
+             [encoder setComputePipelineState:impl_->halationScatterTailBlurXPipeline];
+             [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+@@ -6005,16 +6283,16 @@ bool MetalRenderer::render(
+             [encoder setBytes:&component length:sizeof(component) atIndex:4];
+             dispatch2D(impl_->halationScatterTailBlurYPipeline);
+           }
+-        }
+ 
+-        [encoder setComputePipelineState:impl_->halationScatterResolvePipeline];
+-        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:scatterCoreBuffer offset:0 atIndex:1];
+-        [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:2];
+-        [encoder setBuffer:scatterResolvedBuffer offset:0 atIndex:3];
+-        [encoder setBuffer:paramBuffer offset:0 atIndex:4];
+-        [encoder setBytes:dims length:sizeof(dims) atIndex:5];
+-        dispatch2D(impl_->halationScatterResolvePipeline);
++          [encoder setComputePipelineState:impl_->halationScatterResolvePipeline];
++          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
++          [encoder setBuffer:scatterCoreBuffer offset:0 atIndex:1];
++          [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:2];
++          [encoder setBuffer:scatterResolvedBuffer offset:0 atIndex:3];
++          [encoder setBuffer:paramBuffer offset:0 atIndex:4];
++          [encoder setBytes:dims length:sizeof(dims) atIndex:5];
++          dispatch2D(impl_->halationScatterResolvePipeline);
++        }
+         currentRawBuffer = scatterResolvedBuffer;
+       }
+ 
+@@ -6022,13 +6300,28 @@ bool MetalRenderer::render(
+       bool preExposureDensityReady = false;
+       if (halationBouncePath) {
+         id<MTLBuffer> bounceAccumBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
+-        [encoder setComputePipelineState:impl_->halationClearPipeline];
+-        [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+-        [encoder setBuffer:bounceAccumBuffer offset:0 atIndex:1];
+-        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+-        dispatch2D(impl_->halationClearPipeline);
+-
++        // Bounce 0 initializes bounceAccumBuffer; no clear pass is needed unless
++        // a downsampled bounce, which only adds, comes first.
++        if (halationDownsamplePath && halationBounceScale[0] > 1u) {
++          [encoder setComputePipelineState:impl_->halationClearPipeline];
++          [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
++          [encoder setBuffer:bounceAccumBuffer offset:0 atIndex:1];
++          [encoder setBytes:dims length:sizeof(dims) atIndex:2];
++          dispatch2D(impl_->halationClearPipeline);
++        }
+         for (uint32_t bounce = 0; bounce < 3u; ++bounce) {
++          if (halationDownsamplePath && halationBounceScale[bounce] > 1u) {
++            const uint32_t maxGroup = std::min(std::max(impl_->diffusionGroupSize, 1u), 4u);
++            uint32_t groupCount = 1u;
++            while (bounce + groupCount < 3u && groupCount < maxGroup &&
++                   halationBounceScale[bounce + groupCount] == halationBounceScale[bounce]) {
++              ++groupCount;
++            }
++            encodeDownsampleDiffusionRange(currentRawBuffer, bounceAccumBuffer, halationBounceComponentsBuffer,
++              bounce, groupCount, halationBounceScale[bounce]);
++            bounce += groupCount - 1u;
++            continue;
++          }
+           [encoder setComputePipelineState:impl_->halationBounceBlurXPipeline];
+           [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+           [encoder setBuffer:halationRawBufferD offset:0 atIndex:1];
+@@ -6043,7 +6336,7 @@ bool MetalRenderer::render(
+           [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+           [encoder setBytes:&bounce length:sizeof(bounce) atIndex:4];
+-          dispatch2D(impl_->halationBounceBlurYAccumulatePipeline);
++          dispatch2DSize(impl_->halationBounceBlurYAccumulatePipeline, static_cast<uint32_t>(width), blurBlocksY);
+         }
+ 
+         if (needsPreExposureLogRaw) {
+@@ -6114,6 +6407,7 @@ bool MetalRenderer::render(
+           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+           [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+           [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
++          [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+           dispatch2D(impl_->previewGrainFromDensityPipeline);
+           encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferB);
+         } else {
+@@ -6171,6 +6465,7 @@ bool MetalRenderer::render(
+         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+         [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+         [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
++        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
+         dispatch2D(impl_->previewGrainFromDensityPipeline);
+         encodeFinalFilmDensityOrPrintDiffusion(dirDensityBufferB);
+       } else {
+@@ -6317,6 +6612,14 @@ bool MetalRenderer::render(
+         impl_->floatToStridedHalfBufferPipeline,
+         static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(float) * 4u + sizeof(uint16_t) * 4u)
+       );
++    } else if (adobeHostFrames && !adobeHostDestinationWritten) {
++      [encoder setComputePipelineState:impl_->adobeHostPackPipeline];
++      [encoder setBuffer:dstBuffer offset:0 atIndex:0];
++      [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:1];
++      [encoder setBuffer:externalMetal->destinationBuffer offset:0 atIndex:2];
++      [encoder setBytes:&externalMetal->adobeSourceLayout length:sizeof(AdobeHostLayout) atIndex:3];
++      [encoder setBytes:&externalMetal->adobeDestinationLayout length:sizeof(AdobeHostLayout) atIndex:4];
++      dispatch2D(impl_->adobeHostPackPipeline);
+     }
+     if (destinationHalfWrappedDirectly) {
+       [encoder setComputePipelineState:impl_->floatToHalfBufferPipeline];
+@@ -6344,11 +6647,25 @@ bool MetalRenderer::render(
+       impl_->diagnostics.cpuSetupMs = std::max(0.0, elapsedMilliseconds(renderStart, commandStart) - impl_->diagnostics.sourceCopyMs);
+       [encoder endEncoding];
+       if (externalMetal) {
++#ifndef SPEKTRAFILM_ADOBE_PORT
+         impl_->retainScratchResourcesUntilCompleted(commandBuffer);
++#endif
+       }
+       [commandBuffer commit];
++      auto commitParameterCaches = [&]() {
++        const Impl::ParameterCache committed{parameterKey, impl_->staticResourcesVersion, true};
++        if (frameConstantsEncoded) {
++          impl_->frameConstantsState = committed;
++        }
++        if (spectralLutEncoded) {
++          impl_->spectralLutState = committed;
++        }
++      };
+       if (externalMetal) {
+         impl_->diagnostics.commandBufferMs = 0.0;
++        impl_->lastSubmittedCommandBuffer = commandBuffer;
++        // A GPU failure is detected by the caller; the next call invalidates.
++        commitParameterCaches();
+       } else {
+         [commandBuffer waitUntilCompleted];
+         impl_->diagnostics.commandBufferMs = elapsedMilliseconds(commandStart, PerfClock::now());
+@@ -6359,6 +6676,7 @@ bool MetalRenderer::render(
+           impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+           return false;
+         }
++        commitParameterCaches();
+       }
+     }
+ 
+@@ -6391,14 +6709,25 @@ bool MetalRenderer::render(
+   return true;
+ }
+ 
++void *MetalRenderer::lastSubmittedCommandBuffer() const {
++  return (__bridge void *)impl_->lastSubmittedCommandBuffer;
++}
++
+ bool MetalRenderer::renderMetalBuffers(
+   const MetalBufferImageView &source,
+   const MetalBufferImageView &destination,
+   const RenderWindow &window,
+   const RenderParams &params,
+   double time,
+-  void *commandQueue
++  void *commandQueue,
++  const AdobeHostFrames *adobeHost
+ ) {
++  if (impl_->lastSubmittedCommandBuffer &&
++      [impl_->lastSubmittedCommandBuffer status] == MTLCommandBufferStatusError) {
++    impl_->frameConstantsState.valid = false;
++    impl_->spectralLutState.valid = false;
++  }
++  impl_->lastSubmittedCommandBuffer = nil;
+   if (!isAvailable()) {
+     return false;
+   }
+@@ -6470,6 +6799,23 @@ bool MetalRenderer::renderMetalBuffers(
+   destinationView.components = destination.components;
+   destinationView.bytesPerComponent = destination.bytesPerComponent;
+ 
++  if (adobeHost) {
++    if (adobeHost->source.width != static_cast<uint32_t>(width) || adobeHost->source.height != static_cast<uint32_t>(height) ||
++        adobeHost->destination.width != static_cast<uint32_t>(width) ||
++        adobeHost->destination.height != static_cast<uint32_t>(height)) {
++      impl_->lastError = "Adobe host frame layouts must match the render window.";
++      return false;
++    }
++    // The host layouts replace the view formats; buffers are never wrapped directly.
++    context.adobeHost = true;
++    context.adobeSourceLayout = adobeHost->source;
++    context.adobeDestinationLayout = adobeHost->destination;
++    context.sourceCompactFloat = context.sourceCompactHalf = false;
++    context.sourceStridedFloat = context.sourceStridedHalf = false;
++    context.destinationCompactFloat = context.destinationCompactHalf = false;
++    context.destinationStridedFloat = context.destinationStridedHalf = false;
++  }
++
+   gExternalMetalBufferContext = &context;
+   const bool ok = render(sourceView, destinationView, window, params, time);
+   gExternalMetalBufferContext = nullptr;
+diff --git a/src/SpektraProfileCurves.h b/src/SpektraProfileCurves.h
+index 09f733a..5f57a51 100644
+--- a/src/SpektraProfileCurves.h
++++ b/src/SpektraProfileCurves.h
+@@ -20,6 +20,7 @@ constexpr uint32_t kSpektraPaperCount = 7u;
+ constexpr int32_t kSpektraDefaultFilmIndex = 2;
+ constexpr int32_t kSpektraDefaultPaperIndex = 3;
+ constexpr bool kSpektraAcademyPrinterDensityEnabled = true;
++constexpr bool kSpektraReferenceModel = false;
+ #endif
+ 
+ struct ProfileCurveSet {
+diff --git a/tools/SpektraMetalParityHarness.mm b/tools/SpektraMetalParityHarness.mm
+index 0e92f58..aacd128 100644
+--- a/tools/SpektraMetalParityHarness.mm
++++ b/tools/SpektraMetalParityHarness.mm
+@@ -387,6 +387,10 @@ bool applyParam(const std::string &keyRaw, const std::string &valueRaw, spektraf
+     return fail();
+   }
+   if (key == "color_adaptation") return assignBool(params.colorAdaptation);
++  if (key == "color_adaptation_input_compression") return assignBool(params.colorAdaptationInputCompression);
++  if (key == "color_adaptation_curve_smoothing") return assignBool(params.colorAdaptationCurveSmoothing);
++  if (key == "color_adaptation_output_lightness_compression") return assignBool(params.colorAdaptationOutputLightnessCompression);
++  if (key == "color_adaptation_output_chroma_compression") return assignBool(params.colorAdaptationOutputChromaCompression);
+   if (key == "film" || key == "film_stock") {
+     return findFilmIndex(value, params.film) || fail();
+   }
+diff --git a/tools/generate_profile_curves.py b/tools/generate_profile_curves.py
+index 547e92c..e711957 100644
+--- a/tools/generate_profile_curves.py
++++ b/tools/generate_profile_curves.py
+@@ -17,6 +17,17 @@ DATA_DIR = Path(os.environ.get("SPEKTRAFILM_DATA_DIR", OFX_ROOT / "Resources" /
+ os.environ.setdefault("SPEKTRAFILM_DATA_DIR", str(DATA_DIR))
+ PROFILE_DIR = Path(os.environ.get("SPEKTRAFILM_PROFILE_DIR", DATA_DIR / "profiles"))
+ ARCHIVE_PROFILE_DIR = Path(os.environ.get("SPEKTRAFILM_ARCHIVE_PROFILE_DIR", DATA_DIR / "profiles" / "archive"))
++NEUTRAL_PRINT_FILTERS_PATH = Path(
++    os.environ.get("SPEKTRAFILM_NEUTRAL_PRINT_FILTERS", DATA_DIR / "filters" / "neutral_print_filters.json")
++)
++# Model generation the tables follow. "ofx": the OFX renderer as published,
++# spektrafilm c4f2d23 (2026-05-13). "reference": spektrafilm eac6b85 and later,
++# with CAT16 input adaptation and input gamut compression; use it with the
++# matching profiles and neutral print filters.
++SPEKTRAFILM_MODEL = os.environ.get("SPEKTRAFILM_MODEL", "ofx")
++if SPEKTRAFILM_MODEL not in ("ofx", "reference"):
++    raise SystemExit(f"SPEKTRAFILM_MODEL must be 'ofx' or 'reference', got {SPEKTRAFILM_MODEL!r}.")
++INPUT_CHROMATIC_ADAPTATION = "CAT16" if SPEKTRAFILM_MODEL == "reference" else "CAT02"
+ ST2065_2_DIR = DATA_DIR / "standards" / "smpte_st_2065_2"
+ ST2065_2_APD_RESPONSIVITIES_CSV = "st2065-2a-2020.csv"
+ ST2065_2_INFLUX_SPECTRUM_CSV = "st2065-2b-2020.csv"
+@@ -98,7 +109,7 @@ def _load_filter(
+ 
+ 
+ def read_neutral_print_filters() -> dict:
+-    with (DATA_DIR / "filters" / "neutral_print_filters.json").open("r", encoding="utf-8") as handle:
++    with NEUTRAL_PRINT_FILTERS_PATH.open("r", encoding="utf-8") as handle:
+         return json.load(handle)
+ 
+ 
+@@ -453,6 +464,30 @@ def _density_curves(profile: dict) -> list[list[float]]:
+     return [[float(value) for value in row] for row in profile["data"]["density_curves"]]
+ 
+ 
++def _fitted_density_curves(profile: dict) -> list[list[float]] | None:
++    """Evaluate the profile's parametric density model on its log exposure grid.
++
++    spektrafilm develops prints from this model since a7f0f9a (2026-05-24),
++    not from the tabulated curves; the print-curve morph is off by default, so
++    its output equals the plain model: sum_i A_i * Phi(+-(x - mu_i) / sigma_i),
++    with the sign flipped for positive profiles. Returns None for profiles
++    without a model.
++    """
++    model = profile["data"].get("density_curves_model")
++    if not model or model.get("model_type", "cdfs") != "cdfs":
++        return None
++    centers = np.asarray(model["centers"], dtype=np.float64)
++    if centers.ndim != 2 or centers.size == 0:
++        return None
++    amplitudes = np.asarray(model["amplitudes"], dtype=np.float64)
++    sigmas = np.asarray(model["sigmas"], dtype=np.float64)
++    log_exposure = np.asarray(profile["data"]["log_exposure"], dtype=np.float64)
++    sign = -1.0 if profile["info"].get("type") == "positive" else 1.0
++    z = (log_exposure[:, None, None] - centers[None]) / sigmas[None]
++    fitted = np.sum(amplitudes[None] * scipy.special.ndtr(sign * z), axis=2)
++    return _matrix_to_rows(fitted)
++
++
+ def _matrix_to_rows(matrix: np.ndarray) -> list[list[float]]:
+     return [[float(matrix[row, column]) for column in range(matrix.shape[1])] for row in range(matrix.shape[0])]
+ 
+@@ -467,7 +502,7 @@ def _color_space_to_xyz_matrix(matrix_space: str, reference_illuminant: str) ->
+                 colourspace=matrix_space,
+                 apply_cctf_decoding=False,
+                 illuminant=reference_xy,
+-                chromatic_adaptation_transform="CAT02",
++                chromatic_adaptation_transform=INPUT_CHROMATIC_ADAPTATION,
+             )
+         )
+     return _matrix_to_rows(np.stack(columns, axis=1))
+@@ -1024,7 +1059,10 @@ def _emit_group(group_name: str, stocks: list[str]) -> str:
+         mallett_basis_illuminant = _mallett_basis_illuminant(reference_illuminant)
+         mallett_midgray_green = _mallett_midgray_green(profile, reference_illuminant)
+         log_exposure = [float(value) for value in profile["data"]["log_exposure"]]
+-        density_curves = _normalized_density_curves(profile) if group_name == "film" else _density_curves(profile)
++        if group_name == "film":
++            density_curves = _normalized_density_curves(profile)
++        else:
++            density_curves = _fitted_density_curves(profile) or _density_curves(profile)
+         density_curve_minimum = _density_curve_minimum(profile)
+         density_curve_layers = _numeric_layers(profile, "density_curves_layers")
+         density_curve_layer_maxima = _density_curve_layer_maxima(profile)
+@@ -1253,6 +1291,9 @@ def generate_counts_header() -> str:
+             f"constexpr int32_t kSpektraDefaultFilmIndex = {DEFAULT_FILM_INDEX};",
+             f"constexpr int32_t kSpektraDefaultPaperIndex = {DEFAULT_PAPER_INDEX};",
+             f"constexpr bool kSpektraAcademyPrinterDensityEnabled = {'true' if academy_printer_density_available() else 'false'};",
++            "// Tables follow spektrafilm eac6b85 or later (CAT16 input adaptation); render",
++            "// with input gamut compression to match it.",
++            f"constexpr bool kSpektraReferenceModel = {'true' if SPEKTRAFILM_MODEL == 'reference' else 'false'};",
+             "",
+             "} // namespace spektrafilm",
+             "",
+diff --git a/tools/run_parity_harness.py b/tools/run_parity_harness.py
+index 321958f..a4114eb 100644
+--- a/tools/run_parity_harness.py
++++ b/tools/run_parity_harness.py
+@@ -145,6 +145,10 @@ class ParityParams:
+   scanner_unsharp_amount: float = 0.0
+   deactivate_spatial_effects: bool = True
+   deactivate_stochastic_effects: bool = True
++  # "clip": no output gamut compression, final output clipped to [0, 1]
++  # (spektrafilm before eac6b85). "oklch": OkLch chroma and lightness compression.
++  input_gamut_compress: bool = False
++  output_gamut_compress: str = "clip"
+   unsupported: list[str] = field(default_factory=list)
+ 
+ 
+@@ -282,6 +286,13 @@ def params_to_key_values(params: ParityParams, stage: str) -> str:
+   lines = [f"stage={stage}"]
+   for key in keys:
+     lines.append(f"{key}={value_to_text(getattr(params, key))}")
++  output_compress = params.output_gamut_compress == "oklch"
++  if params.input_gamut_compress or output_compress:
++    lines.append("color_adaptation=true")
++    lines.append("color_adaptation_curve_smoothing=false")
++    lines.append(f"color_adaptation_input_compression={value_to_text(params.input_gamut_compress)}")
++    lines.append(f"color_adaptation_output_lightness_compression={value_to_text(output_compress)}")
++    lines.append(f"color_adaptation_output_chroma_compression={value_to_text(output_compress)}")
+   return "\n".join(lines) + "\n"
+ 
+ 
+@@ -365,6 +376,35 @@ def install_python_profile_compatibility() -> None:
+   profile_io._spektra_parity_compat_installed = True
+ 
+ 
++def install_python_data_redirect() -> None:
++  """Serve spektrafilm.data.* from SPEKTRAFILM_DATA_DIR, the data the Metal build uses.
++
++  The published Python package loads profiles, neutral print filters and LUTs
++  from its own package directory. Without this, the reference silently uses
++  another data revision: the package's neutral print filters alone shift
++  print_log_raw by up to 0.025 log10 per channel. Subpackages missing from the
++  data directory still load from the package.
++  """
++  import importlib.resources as resources
++
++  if getattr(resources, "_spektra_parity_data_redirect", False):
++    return
++  original_files = resources.files
++  prefix = "spektrafilm.data."
++
++  def files(package):
++    name = package if isinstance(package, str) else getattr(package, "__name__", "")
++    data_dir = os.environ.get("SPEKTRAFILM_DATA_DIR")
++    if data_dir and name.startswith(prefix):
++      candidate = Path(data_dir, *name[len(prefix):].split("."))
++      if candidate.is_dir():
++        return candidate
++    return original_files(package)
++
++  resources.files = files
++  resources._spektra_parity_data_redirect = True
++
++
+ def build_python_params(parity: ParityParams):
+   if str(SRC_DIR) not in sys.path:
+     sys.path.insert(0, str(SRC_DIR))
+@@ -373,8 +413,22 @@ def build_python_params(parity: ParityParams):
+   from spektrafilm.runtime.params_builder import digest_params, init_params
+ 
+   params = init_params(parity.film, parity.paper)
+-  params.settings.rgb_to_raw_method = "hanatos2025"
+-  params.settings.bandpass_hanatos2025 = True
++  settings = params.settings
++  has_window = hasattr(settings, "apply_hanatos2025_adaptation_window")
++  if parity.rgb_to_raw_method == "hanatos2026":
++    # The renderer's Hanatos2026 is Python's hanatos2025 with the per-stock
++    # adaptation window (c4f2d23 and later), without the surface.
++    if not has_window:
++      raise RuntimeError("rgb_to_raw_method=hanatos2026 needs a spektrafilm with the Hanatos 2025 adaptation window (c4f2d23 or later); use --rgb-to-raw-method hanatos2025 for older versions.")
++    settings.rgb_to_raw_method = "hanatos2025"
++    settings.apply_hanatos2025_adaptation_window = True
++    settings.apply_hanatos2025_adaptation_surface = False
++  else:
++    settings.rgb_to_raw_method = parity.rgb_to_raw_method
++    settings.bandpass_hanatos2025 = True
++    if has_window:
++      settings.apply_hanatos2025_adaptation_window = False
++      settings.apply_hanatos2025_adaptation_surface = False
+   params.settings.use_enlarger_lut = False
+   params.settings.use_scanner_lut = False
+   params.settings.use_fast_stats = False
+@@ -385,6 +439,13 @@ def build_python_params(parity: ParityParams):
+   params.io.output_color_space = _python_color_space(parity.output_color_space)
+   params.io.output_cctf_encoding = False
+   params.io.scan_film = parity.process == "scan_negative"
++  if hasattr(params.io, "input_gamut_compress"):
++    from spektrafilm.utils.gamut_compression import InputGamutCompressSpec, OutputGamutCompressSpec
++    params.io.input_gamut_compress = InputGamutCompressSpec(active=parity.input_gamut_compress)
++    algorithm = "off" if parity.output_gamut_compress == "clip" else parity.output_gamut_compress
++    params.io.output_gamut_compress = OutputGamutCompressSpec(algorithm=algorithm)
++  elif parity.input_gamut_compress or parity.output_gamut_compress != "clip":
++    raise RuntimeError("Gamut compression needs a spektrafilm with input and output gamut compression (eac6b85 or later).")
+   params.enlarger.print_exposure = 2.0 ** parity.print_exposure_ev
+   params.film_render.density_curve_gamma = parity.film_gamma
+   params.print_render.density_curve_gamma = parity.print_gamma
+@@ -459,7 +520,11 @@ def run_python_stage(image: np.ndarray, stage: str, parity: ParityParams) -> np.
+   print_density_cmy = pipeline._printing_stage.develop(print_log_raw)
+   if stage == "print_density_cmy":
+     return print_density_cmy
+-  return pipeline._scanning_stage.scan(print_density_cmy)
++  final = pipeline._scanning_stage.scan(print_density_cmy)
++  if parity.output_gamut_compress == "clip":
++    # Versions with output gamut compression no longer clip when it is off.
++    final = np.clip(final, 0.0, 1.0)
++  return final
+ 
+ 
+ def to_rgba(image: np.ndarray) -> np.ndarray:
+@@ -1032,6 +1097,10 @@ def write_reports(output_dir: Path, metrics_rows: list[dict], manifest_cases: li
+       "build_dir": str(args.build_dir),
+       "python_data_dir": str(getattr(args, "python_data_dir", "")),
+       "python_profile_dir": str(getattr(args, "python_profile_dir", "")),
++      "python_package_data": bool(getattr(args, "python_package_data", False)),
++      "rgb_to_raw_method": str(getattr(args, "rgb_to_raw_method", "")),
++      "input_gamut_compress": bool(getattr(args, "input_gamut_compress", False)),
++      "output_gamut_compress": str(getattr(args, "output_gamut_compress", "")),
+       "reference_cache_dir": str(getattr(args, "reference_cache_dir", "") or ""),
+       "refresh_reference_cache": bool(getattr(args, "refresh_reference_cache", False)),
+       "mode": args.mode,
+@@ -1083,6 +1152,10 @@ def main(argv: list[str] | None = None) -> int:
+   parser.add_argument("--skip-metal", action="store_true", help="Generate Python references and reports without running Metal.")
+   parser.add_argument("--python-profile-dir", type=Path, default=DEFAULT_ARCHIVE_PROFILE_DIR, help="Profile JSON directory for the local Python reference. Defaults to Resources/data/profiles/archive.")
+   parser.add_argument("--python-data-dir", type=Path, help="Prepared SpektraFilm Python data directory. Defaults to OUTPUT/python_data.")
++  parser.add_argument("--rgb-to-raw-method", choices=("hanatos2026", "hanatos2025", "mallett2019"), default="hanatos2026", help="RGB-to-raw method for every case. Defaults to hanatos2026, the renderer default (Python hanatos2025 with the adaptation window, c4f2d23 or later). Use hanatos2025 (archived bandpass) for spektrafilm versions before the adaptation window.")
++  parser.add_argument("--input-gamut-compress", action="store_true", help="Enable input gamut compression on both sides (spektrafilm eac6b85 or later).")
++  parser.add_argument("--output-gamut-compress", choices=("clip", "oklch"), default="clip", help="Output handling on both sides: clip to [0, 1] without compression (default), or OkLch chroma and lightness compression (spektrafilm eac6b85 or later).")
++  parser.add_argument("--python-package-data", action="store_true", help="Let the Python reference load its own package data (profiles, filters, LUTs) instead of the prepared data directory.")
+   parser.add_argument("--reference-cache-dir", type=Path, help="Directory for cached Python reference arrays reused across Metal candidate runs.")
+   parser.add_argument("--refresh-reference-cache", action="store_true", help="Regenerate Python references even when cache entries exist.")
+   args = parser.parse_args(argv)
+@@ -1094,10 +1167,16 @@ def main(argv: list[str] | None = None) -> int:
+   os.environ.setdefault("XDG_CACHE_HOME", str(args.output / ".cache"))
+   args.python_data_dir = prepare_python_data_dir(args.output, args.python_profile_dir, args.python_data_dir)
+   os.environ["SPEKTRAFILM_DATA_DIR"] = str(args.python_data_dir)
++  if not args.python_package_data:
++    install_python_data_redirect()
+   args.harness = args.harness or (args.build_dir / "SpektraFilmParityHarness")
+   patterns = select_patterns(make_patterns(args.width, args.height), parse_csv_set(args.patterns))
+   cases = quick_cases(patterns) if args.mode == "quick" else full_cases(patterns)
+   cases = filter_cases(cases, parse_csv_set(args.stages))
++  for case in cases:
++    case.params.rgb_to_raw_method = args.rgb_to_raw_method
++    case.params.input_gamut_compress = args.input_gamut_compress
++    case.params.output_gamut_compress = args.output_gamut_compress
+   if not cases:
+     raise SystemExit("No parity cases selected.")
+   metrics_rows, manifest_cases = run_cases(

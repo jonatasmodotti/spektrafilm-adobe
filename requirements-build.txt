@@ -1,0 +1,4 @@
+# Table generation only. No Python interpreter is embedded in the native renderer.
+numpy==2.4.6
+scipy==1.17.1
+colour-science==0.4.7

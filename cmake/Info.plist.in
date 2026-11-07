@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>SpektraFilm</string>
+  <key>CFBundleIdentifier</key><string>org.spektrafilm.adobe</string>
+  <key>CFBundleName</key><string>spektrafilm</string>
+  <key>CFBundlePackageType</key><string>eFKT</string>
+  <key>CFBundleSignature</key><string>FXTC</string>
+  <key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
+  <key>CFBundleVersion</key><string>@PROJECT_VERSION@</string>
+  <key>NSHumanReadableCopyright</key><string>Film model: spektrafilm by Andrea Volpato. Native engine: spektrafilm-ofx by Aedan Diez. GPL-3.0.</string>
+</dict></plist>

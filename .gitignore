@@ -1,0 +1,23 @@
+# Build output and local tooling
+/build*/
+/.venv/
+__pycache__/
+*.metallib
+*.air
+
+# Fetched by tools/bootstrap.py
+/third_party/spektrafilm-ofx/
+/third_party/spektrafilm/
+
+# Adobe SDKs: download them from Adobe, never commit them
+/sdks/
+
+# Local host projects and their auto-saves
+*.aep
+*.prproj
+*Auto-Save/
+*automático/
+
+# OS files
+.DS_Store
+Thumbs.db
